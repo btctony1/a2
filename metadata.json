@@ -1,0 +1,7 @@
+{
+  "name": "OKX Auto Trader",
+  "description": "OKX Contract Auto-Trading System powered by Cloudflare Workers and Hono",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
