@@ -1,5 +1,6 @@
 import type { OKXClient, CoinPair, OKXTicker } from '../types';
 import { getCoinPairs, updateCoinPair, insertSystemLog, batchUpdateCoinPairs, batchInsertSystemLogs } from '../db/queries';
+import { isCycleTimeout, isSubrequestLimitReached } from '../okx/signer';
 
 export interface ParsedPeriod {
   value: number;
@@ -15,12 +16,6 @@ export interface DirectionCalculationResult {
   currentVolatility: number;
   volatilityStatus: 'active' | 'paused';
   logMessage: string;
-  prev1Open: number;
-  prev1Close: number;
-  prev1High: number;
-  prev1Low: number;
-  prev2High: number;
-  prev2Low: number;
 }
 
 export function parsePeriod(period: string | number): ParsedPeriod | null {
@@ -61,26 +56,318 @@ export function parsePeriod(period: string | number): ParsedPeriod | null {
   return null;
 }
 
-export function getOkxBar(parsed: ParsedPeriod): string {
-  if (parsed.unit === 'd') {
-    return `${parsed.value}D`;
+export async function calculateSingleDirection(
+  client: OKXClient,
+  coin: CoinPair,
+  reason: 'scheduled' | 'immediate' = 'scheduled',
+  tickerMap?: Map<string, OKXTicker>
+): Promise<DirectionCalculationResult> {
+  const parsed = parsePeriod(coin.period) || { value: 1, unit: 'h', bar: '1H', periodMs: 3600000, displayName: '1h' };
+
+  const instId = coin.symbol.endsWith('-SWAP')
+    ? coin.symbol
+    : (coin.symbol.includes('-') ? (coin.symbol.endsWith('-USDT') ? `${coin.symbol}-SWAP` : coin.symbol) : `${coin.symbol}-USDT-SWAP`);
+
+  const nowTs = Date.now();
+  // 拉取最近 6 根 K 线，保证获得充足且连续的历史数据
+  const rawCandles = await client.getCandles(instId, parsed.bar, 6);
+  if (!rawCandles || rawCandles.length === 0) {
+    throw new Error(`OKX 未返回 K 线数据`);
   }
-  if (parsed.unit === 'h') {
-    if (parsed.value === 24) return '1D';
-    if (parsed.value === 48) return '2D';
-    return `${parsed.value}H`;
+
+  // 严格过滤有效数据（排除开高低收为 0 的异常脏数据）
+  const validCandles = rawCandles.filter((c) => {
+    const o = parseFloat(c.o || '0');
+    const h = parseFloat(c.h || '0');
+    const l = parseFloat(c.l || '0');
+    const cp = parseFloat(c.c || '0');
+    const ts = Number(c.ts || '0');
+    return ts > 0 && o > 0 && h > 0 && l > 0 && cp > 0;
+  });
+
+  if (validCandles.length === 0) {
+    throw new Error(`K 线数据中无有效报价 (开/收/高/低均为 0)`);
   }
-  return `${parsed.value}m`;
+
+  // 按时间戳从近到远（最新在前）严格排序
+  validCandles.sort((a, b) => Number(b.ts) - Number(a.ts));
+
+  // 核心筛选：严格基于时间戳筛选已经完全收盘定型的完结 K 线（开始时间戳 + 周期跨度 <= 当前时间戳）
+  const completedCandles = validCandles.filter((c) => {
+    const startTs = Number(c.ts);
+    return !isNaN(startTs) && (startTs + parsed.periodMs <= nowTs);
+  });
+
+  // 兜底保护：若因服务器时钟微小偏差未能直接通过时间戳匹配出完结 K 线，则剔除第 0 根正在生成的未完结 K 线
+  if (completedCandles.length === 0) {
+    if (validCandles.length > 1) {
+      completedCandles.push(...validCandles.slice(1));
+    } else {
+      completedCandles.push(validCandles[0]);
+    }
+  }
+
+  // 1. 最近 1 根已完结 K 线 (最靠近当前时间点、收盘价已物理固定的 K 线)
+  const prev1 = completedCandles[0];
+  const open1 = parseFloat(prev1.o || '0');
+  const close1 = parseFloat(prev1.c || '0');
+  const high1 = parseFloat(prev1.h || prev1.c || '0');
+  const low1 = parseFloat(prev1.l || prev1.c || '0');
+  const ts1 = Number(prev1.ts);
+
+  if (open1 <= 0 || close1 <= 0 || high1 <= 0 || low1 <= 0) {
+    throw new Error(`完结 K 线数值异常 (开${open1} 收${close1} 高${high1} 低${low1})`);
+  }
+
+  // 核心方向研判：严格按照完结 K 线判定（收盘 >= 开盘 为阳线做多，收盘 < 开盘 为阴线做空）
+  const isBullish = close1 >= open1;
+  const direction: 'long' | 'short' = isBullish ? 'long' : 'short';
+  const klineText = isBullish ? '阳线/上涨' : '阴线/下跌';
+  const dirText = direction === 'long' ? '做多' : '做空';
+
+  // 2. 智能下单振幅研判：严格基于临近完结的 2 根真实 K 线 (completedCandles[0] 和 completedCandles[1])
+  let currentVolatility = 0;
+  let volSummaryText = '';
+  if (completedCandles.length >= 2) {
+    const prev2 = completedCandles[1];
+    const high2 = parseFloat(prev2.h || prev2.c || '0');
+    const low2 = parseFloat(prev2.l || prev2.c || '0');
+
+    if (high2 > 0 && low2 > 0) {
+      const maxHigh = Math.max(high1, high2);
+      const minLow = Math.min(low1, low2);
+      const basePrice = minLow > 0 ? minLow : open1;
+      if (basePrice > 0 && maxHigh >= minLow) {
+        currentVolatility = parseFloat((((maxHigh - minLow) / basePrice) * 100).toFixed(2));
+        volSummaryText = `当前振幅 ${currentVolatility}% (近2根完结K线: 最高${maxHigh} 最低${minLow})`;
+      }
+    }
+  }
+
+  if (!volSummaryText) {
+    // 仅有 1 根完结 K 线时的单根振幅计算
+    const basePrice = low1 > 0 ? low1 : open1;
+    currentVolatility = parseFloat((((high1 - low1) / basePrice) * 100).toFixed(2));
+    volSummaryText = `当前振幅 ${currentVolatility}% (近1根完结K线: 最高${high1} 最低${low1})`;
+  }
+
+  // 智能波动过滤与阈值判定
+  const minThreshold = (coin.min_volatility_threshold !== undefined && coin.min_volatility_threshold !== null) ? coin.min_volatility_threshold : 1.0;
+  const isVolBelow = coin.smart_volatility_enabled && (currentVolatility < minThreshold);
+  const volatilityStatus = isVolBelow ? 'paused' : 'active';
+
+  let candleTimeInfo = '';
+  if (ts1 > 0) {
+    const d = new Date(ts1);
+    const iso = d.toISOString().replace('T', ' ').substring(0, 16);
+    candleTimeInfo = ` (完结K线: ${iso} UTC)`;
+  }
+
+  const reasonText = reason === 'immediate' ? ' (立即生效/参数更新)' : '';
+  let smartVolText = '';
+  if (coin.smart_volatility_enabled) {
+    if (isVolBelow) {
+      smartVolText = ` | 智能波动: ${volSummaryText} < 阈值 ${minThreshold}% ⏸️ 自动暂停下单`;
+    } else {
+      smartVolText = ` | 智能波动: ${volSummaryText} ≥ 阈值 ${minThreshold}% ▶️ 恢复正常下单`;
+    }
+  }
+
+  const logMessage = `${coin.symbol} [${parsed.bar}周期${candleTimeInfo}]: 最近1根完结K线(${klineText}: 开${open1} 收${close1} 高${high1} 低${low1}) → 判定方向【${dirText}】${reasonText}${smartVolText}`;
+
+  return {
+    coin,
+    direction,
+    currentVolatility,
+    volatilityStatus,
+    logMessage,
+  };
 }
 
-export function formatInstId(symbol: string): string {
-  const sym = (symbol || '').trim().toUpperCase();
-  if (sym.endsWith('-SWAP')) return sym;
-  if (sym.includes('-')) return sym.endsWith('-USDT') ? `${sym}-SWAP` : sym;
-  return `${sym}-USDT-SWAP`;
+export async function executeSingleDirectionCalculation(
+  client: OKXClient,
+  env: Env,
+  coin: CoinPair,
+  reason: 'scheduled' | 'immediate' = 'scheduled',
+  tickerMap?: Map<string, OKXTicker>
+): Promise<'long' | 'short'> {
+  const res = await calculateSingleDirection(client, coin, reason, tickerMap);
+  const now = Date.now();
+  coin.direction = res.direction;
+  coin.direction_updated_at = now;
+  coin.current_volatility = res.currentVolatility;
+  coin.volatility_status = res.volatilityStatus;
+
+  await updateCoinPair(env, coin.symbol, {
+    direction: res.direction,
+    direction_updated_at: now,
+    current_volatility: res.currentVolatility,
+    volatility_status: res.volatilityStatus,
+  });
+
+  await insertSystemLog(env, 'direction', res.logMessage);
+  return res.direction;
 }
 
-export function getPeriodStart(ts: number, parsed: ParsedPeriod): number {
+export async function refreshCoinDirection(
+  client: OKXClient,
+  env: Env,
+  coin: CoinPair,
+  reason: 'scheduled' | 'immediate' = 'scheduled',
+  tickerMap?: Map<string, OKXTicker>
+): Promise<'long' | 'short'> {
+  const parsed = parsePeriod(coin.period) || { value: 1, unit: 'h', bar: '1H', periodMs: 3600000, displayName: '1h' };
+
+  try {
+    return await executeSingleDirectionCalculation(client, env, coin, reason, tickerMap);
+  } catch (firstErr: any) {
+    // 首次失败，等待 2200ms 后重试一次
+    await new Promise((r) => setTimeout(r, 2200));
+
+    try {
+      return await executeSingleDirectionCalculation(client, env, coin, reason, tickerMap);
+    } catch (retryErr: any) {
+      const errMsg = retryErr?.message || String(retryErr);
+      console.warn(`[${coin.symbol}] 获取K线判定方向/波动率重试后仍失败:`, errMsg);
+
+      const fallbackDir = coin.direction || 'long';
+      const fallbackDirText = fallbackDir === 'long' ? '做多' : '做空';
+      const fallbackVol = coin.current_volatility !== undefined && coin.current_volatility !== null ? coin.current_volatility : 0;
+
+      // 铁律：重试后仍失败绝不更新 direction_updated_at，以便延续到下一个主循环继续执行，直到全部成功！
+      await insertSystemLog(
+        env,
+        'warn',
+        `${coin.symbol} [${parsed.bar}周期]: 获取K线判定失败 (2200ms重试后仍失败: ${errMsg})，保持原方向【${fallbackDirText}】与原振幅 ${fallbackVol}%，延续至下一主循环继续执行`
+      );
+
+      return fallbackDir;
+    }
+  }
+}
+
+export async function checkDirection(
+  client: OKXClient,
+  env: Env,
+  tickerMap?: Map<string, OKXTicker>,
+  cachedCoins?: CoinPair[]
+): Promise<void> {
+  const coinPairs = cachedCoins || (await getCoinPairs(env));
+  const nowTs = Date.now();
+
+  const toRefresh: Array<{ coin: CoinPair; immediate: boolean; parsed: ParsedPeriod }> = [];
+
+  for (const coin of coinPairs) {
+    if (!coin.enabled) continue;
+
+    const parsed = parsePeriod(coin.period);
+    if (!parsed) continue;
+
+    const lastUpdatedTs = coin.direction_updated_at || 0;
+    const needsImmediate = coin.direction === null || lastUpdatedTs === 0;
+
+    // 核心守卫：如果已有有效方向且尚未跨入新的周期边界，100% 走纯内存/数据库命中，0 网络开销
+    // 若此前拉取失败未更新 direction_updated_at，此处将持续命中并自动延续到当前主循环执行，直到全部成功
+    if (needsImmediate || isPeriodBoundary(nowTs, parsed, lastUpdatedTs)) {
+      toRefresh.push({ coin, immediate: needsImmediate, parsed });
+    }
+  }
+
+  // 绝大部分分钟轮次，没有跨周期的币种，0ms 直接极速返回
+  if (toRefresh.length === 0) return;
+
+  // 优先处理从未判定方向的币种
+  toRefresh.sort((a, b) => (a.immediate === b.immediate ? 0 : a.immediate ? -1 : 1));
+
+  // 第一轮：批量并发拉取到达周期判定点的所有币种进行判断与研判（纯内存计算，不逐个写库）
+  const successfulResults: DirectionCalculationResult[] = [];
+  const failedItems: Array<{ coin: CoinPair; immediate: boolean; parsed: ParsedPeriod; firstError: string }> = [];
+
+  await Promise.all(
+    toRefresh.map(async (item) => {
+      try {
+        const res = await calculateSingleDirection(client, item.coin, item.immediate ? 'immediate' : 'scheduled', tickerMap);
+        successfulResults.push(res);
+      } catch (err: any) {
+        failedItems.push({
+          ...item,
+          firstError: err?.message || String(err),
+        });
+      }
+    })
+  );
+
+  // 如果有失败项，在未达到熔断限制时精确等待 2200ms 后对失败币种进行批量重试
+  if (failedItems.length > 0 && !isCycleTimeout() && !isSubrequestLimitReached()) {
+    await new Promise((r) => setTimeout(r, 2200));
+
+    if (isCycleTimeout() || isSubrequestLimitReached()) {
+      return;
+    }
+
+    const warnLogs: Array<{ type: string; message: string }> = [];
+
+    await Promise.all(
+      failedItems.map(async ({ coin, immediate, parsed, firstError }) => {
+        try {
+          const res = await calculateSingleDirection(client, coin, immediate ? 'immediate' : 'scheduled', tickerMap);
+          successfulResults.push(res);
+        } catch (retryErr: any) {
+          const errMsg = retryErr?.message || String(retryErr);
+          console.warn(`[${coin.symbol}] 批量周期判定2200ms重试后仍失败:`, errMsg);
+
+          const fallbackDir = coin.direction || 'long';
+          const fallbackDirText = fallbackDir === 'long' ? '做多' : '做空';
+          const fallbackVol = coin.current_volatility !== undefined && coin.current_volatility !== null ? coin.current_volatility : 0;
+
+          // 铁律：重试后仍失败绝不更新 direction_updated_at，以便延续到下一个主循环继续执行，直到全部成功！
+          warnLogs.push({
+            type: 'warn',
+            message: `${coin.symbol} [${parsed.bar}周期]: 获取K线判定失败 (2200ms重试后仍失败: ${errMsg})，保持原方向【${fallbackDirText}】与原振幅 ${fallbackVol}%，延续至下一主循环继续执行`
+          });
+        }
+      })
+    );
+
+    if (warnLogs.length > 0) {
+      await batchInsertSystemLogs(env, warnLogs);
+    }
+  }
+
+  // 全局轻量批量写入：所有成功币种合并为 1 次 D1 batch 更新，1 次 D1 batch 插入系统日志
+  if (successfulResults.length > 0) {
+    const now = Date.now();
+    const updatesList = successfulResults.map((res) => {
+      // 内存中即时同步，供后续开仓阶段零延迟复用，无需重读 D1
+      res.coin.direction = res.direction;
+      res.coin.direction_updated_at = now;
+      res.coin.current_volatility = res.currentVolatility;
+      res.coin.volatility_status = res.volatilityStatus;
+
+      return {
+        symbol: res.coin.symbol,
+        updates: {
+          direction: res.direction,
+          direction_updated_at: now,
+          current_volatility: res.currentVolatility,
+          volatility_status: res.volatilityStatus,
+        },
+      };
+    });
+
+    const logsList = successfulResults.map((res) => ({
+      type: 'direction',
+      message: res.logMessage,
+    }));
+
+    await Promise.all([
+      batchUpdateCoinPairs(env, updatesList),
+      batchInsertSystemLogs(env, logsList),
+    ]);
+  }
+}
+
+function getPeriodStart(ts: number, parsed: ParsedPeriod): number {
   const d = new Date(ts);
   d.setUTCSeconds(0, 0);
   if (parsed.unit === 'm') {
@@ -98,420 +385,9 @@ export function getPeriodStart(ts: number, parsed: ParsedPeriod): number {
   return d.getTime();
 }
 
-/**
- * 权威全局研判核心（纯内存计算，0 次额外网络请求）：
- *
- * 铁律原则：
- * 1. 方向判定：100% 严格由【上一完整周期】已封线定格的开盘价与收盘价判定（阳线做多，阴线做空）！
- * 2. 振幅研判：100% 严格由【上一完整周期】与【上二完整周期】的真实历史定格极值计算振幅！
- * 3. 绝对不拿实时现价伪造历史 K 线，绝对不使用当前正在走的未收盘数据替代完整周期！
- */
-export function evaluateHistoricalPeriod(
-  coin: CoinPair,
-  okxBar: string,
-  prev1Open: number,
-  prev1Close: number,
-  prev1High: number,
-  prev1Low: number,
-  prev2High: number,
-  prev2Low: number,
-  reason: 'scheduled' | 'immediate' = 'scheduled'
-): DirectionCalculationResult {
-  // 1. 方向判定：严格基于【上一完整周期】已封线的历史开盘价与收盘价
-  const isBullish = prev1Close >= prev1Open;
-  const direction: 'long' | 'short' = isBullish ? 'long' : 'short';
-  const klineType = isBullish ? '阳线(做多)' : '阴线(做空)';
-  const dirText = direction === 'long' ? '做多' : '做空';
-
-  // 2. 智能下单振幅研判：严格基于【上两个完整周期】（上一周期 + 上二周期）的历史定格极值
-  const maxHigh = Math.max(prev1High, prev2High);
-  const minLow = Math.min(prev1Low, prev2Low);
-
-  // 振幅公式：((上两周期最高 - 上两周期最低) / 上两周期最低) * 100%
-  const currentVolatility = minLow > 0 ? parseFloat((((maxHigh - minLow) / minLow) * 100).toFixed(2)) : 0;
-
-  // 智能下单过滤与阈值判定
-  const minThreshold =
-    coin.min_volatility_threshold !== undefined && coin.min_volatility_threshold !== null
-      ? coin.min_volatility_threshold
-      : 1.0;
-  const isVolBelow = coin.smart_volatility_enabled && currentVolatility < minThreshold;
-  const volatilityStatus: 'active' | 'paused' = isVolBelow ? 'paused' : 'active';
-
-  const reasonText = reason === 'immediate' ? ' (立即生效/参数更新)' : '';
-
-  // 严格按照用户指定的标准规范日志格式输出：
-  // [09/15 11:00:04] GPS-USDT-SWAP [5m周期K线]: (上一完整周期开盘价：0.0***，上一完整周期收盘价：0.0*** → 阳线(做多))，判定方向【做多】 | 智能下单: (上一完整周期最高价：0.0***，上一完整周期最低价：0.0***，上二完整周期最高价：0.0***，上二完整周期最低价：0.0***) 振幅0.**% < 阈值 1% ⏸️ 自动暂停下单
-  let smartVolText = '';
-  if (coin.smart_volatility_enabled) {
-    if (isVolBelow) {
-      smartVolText = ` | 智能下单: (上一完整周期最高价：${prev1High}，上一完整周期最低价：${prev1Low}，上二完整周期最高价：${prev2High}，上二完整周期最低价：${prev2Low}) 振幅${currentVolatility}% < 阈值 ${minThreshold}% ⏸️ 自动暂停下单`;
-    } else {
-      smartVolText = ` | 智能下单: (上一完整周期最高价：${prev1High}，上一完整周期最低价：${prev1Low}，上二完整周期最高价：${prev2High}，上二完整周期最低价：${prev2Low}) 振幅${currentVolatility}% ≥ 阈值 ${minThreshold}% ▶️ 恢复正常下单`;
-    }
-  } else {
-    smartVolText = ` | 智能下单未开启: (上一完整周期最高价：${prev1High}，上一完整周期最低价：${prev1Low}，上二完整周期最高价：${prev2High}，上二完整周期最低价：${prev2Low}) 振幅${currentVolatility}%`;
-  }
-
-  const logMessage = `${coin.symbol} [${okxBar}周期K线]: (上一完整周期开盘价：${prev1Open}，上一完整周期收盘价：${prev1Close} → ${klineType})，判定方向【${dirText}】${smartVolText}${reasonText}`;
-
-  return {
-    coin,
-    direction,
-    currentVolatility,
-    volatilityStatus,
-    logMessage,
-    prev1Open,
-    prev1Close,
-    prev1High,
-    prev1Low,
-    prev2High,
-    prev2Low,
-  };
-}
-
-/**
- * 全局行情快照方向与振幅研判（单次快照，全局研判，0 次逐币请求）
- *
- * 架构核心：
- * 1. 每次循环拉取一次全局行情大包快照（tickerMap），包含全市场所有币种！
- * 2. 对所有开启的币种执行全内存判定与流转，绝不发起任何单个币种的网络请求！
- * 3. 严格维护【当前周期】与【上一完整周期】、【上二完整周期】的持久化数据：
- *    - 当跨入新周期时刻：
- *      * 上二完整周期 继承 上一完整周期的极值；
- *      * 上一完整周期 继承 刚刚封线的周期的完整开、收、高、低；
- *      * 基于上一完整周期判定方向，基于上二 + 上一完整周期研判振幅；
- *      * 开启新周期的当前记录；
- *    - 当处于同一周期内：
- *      * 累计更新当前周期的最高价、最低价与最新价；
- * 4. 计算完毕后一次性批量写入 D1 数据库和系统日志。
- */
-export async function checkDirection(
-  client: OKXClient,
-  env: Env,
-  tickerMap?: Map<string, OKXTicker>,
-  cachedCoins?: CoinPair[]
-): Promise<void> {
-  const coinPairs = cachedCoins || (await getCoinPairs(env));
-  const activeCoins = coinPairs.filter((c) => c.enabled && c.period);
-  if (activeCoins.length === 0) return;
-
-  // 1. 确保拥有全局快照（单次网络大包，包含全量合约，绝不逐币请求）
-  let activeTickerMap = tickerMap;
-  if (!activeTickerMap || activeTickerMap.size === 0) {
-    try {
-      activeTickerMap = await client.getTickersByType('SWAP');
-    } catch (e) {
-      console.warn('[checkDirection] 获取全量SWAP行情快照失败:', e);
-      return;
-    }
-  }
-
-  const nowTs = Date.now();
-  const updatesList: Array<{ symbol: string; updates: Record<string, any> }> = [];
-  const logsList: Array<{ type: string; message: string }> = [];
-
-  // 2. 遍历全量币种，全部在内存中做全局研判（0 网络请求）
-  for (const coin of activeCoins) {
-    const parsed = parsePeriod(coin.period);
-    if (!parsed) continue;
-
-    const okxBar = getOkxBar(parsed);
-    const instId = formatInstId(coin.symbol);
-
-    // 从全局快照中寻找对应行情（支持标准 instId 及原始 symbol）
-    const ticker = activeTickerMap.get(instId) || activeTickerMap.get(coin.symbol);
-    if (!ticker || !ticker.last) continue;
-
-    const snapshotPrice = parseFloat(ticker.last);
-    if (isNaN(snapshotPrice) || snapshotPrice <= 0) continue;
-
-    const currentPeriodStart = getPeriodStart(nowTs, parsed);
-    const recordedPeriodStart = coin.period_start_time || 0;
-
-    // 是否跨入新周期（即上一个周期已经走完封线）
-    const isNewPeriod = recordedPeriodStart === 0 || currentPeriodStart > recordedPeriodStart;
-
-    if (isNewPeriod) {
-      let prev1Open = 0;
-      let prev1Close = 0;
-      let prev1High = 0;
-      let prev1Low = 0;
-      let prev2High = 0;
-      let prev2Low = 0;
-
-      if (recordedPeriodStart > 0 && coin.cur_open && coin.cur_open > 0) {
-        // 权威正常周期流转：
-        // 上二完整周期 继承 上一完整周期的历史极值
-        prev2High = coin.prev1_high && coin.prev1_high > 0 ? coin.prev1_high : (coin.cur_high || snapshotPrice);
-        prev2Low = coin.prev1_low && coin.prev1_low > 0 ? coin.prev1_low : (coin.cur_low || snapshotPrice);
-
-        // 上一完整周期 封线定格刚刚结束的周期的完整数据
-        prev1Open = coin.cur_open;
-        prev1Close = coin.cur_close && coin.cur_close > 0 ? coin.cur_close : snapshotPrice;
-        prev1High = coin.cur_high && coin.cur_high > 0 ? coin.cur_high : Math.max(prev1Open, prev1Close);
-        prev1Low = coin.cur_low && coin.cur_low > 0 ? coin.cur_low : Math.min(prev1Open, prev1Close);
-      } else if (coin.prev1_open && coin.prev1_open > 0 && coin.prev1_close && coin.prev1_close > 0) {
-        // 已有该周期的权威校准历史，直接沿用
-        prev1Open = coin.prev1_open;
-        prev1Close = coin.prev1_close;
-        prev1High = coin.prev1_high || Math.max(prev1Open, prev1Close);
-        prev1Low = coin.prev1_low || Math.min(prev1Open, prev1Close);
-        prev2High = coin.prev2_high || prev1High;
-        prev2Low = coin.prev2_low || prev1Low;
-      } else {
-        // 首次加入尚无任何历史记录：以当前现价平价初始化种子，绝不拿全天24h假数据充当当前周期数据
-        prev1Open = snapshotPrice;
-        prev1Close = snapshotPrice;
-        prev1High = snapshotPrice;
-        prev1Low = snapshotPrice;
-        prev2High = snapshotPrice;
-        prev2Low = snapshotPrice;
-      }
-
-      // 执行纯历史周期的方向判定与振幅研判
-      const res = evaluateHistoricalPeriod(
-        coin,
-        okxBar,
-        prev1Open,
-        prev1Close,
-        prev1High,
-        prev1Low,
-        prev2High,
-        prev2Low,
-        recordedPeriodStart === 0 ? 'immediate' : 'scheduled'
-      );
-
-      // 同步内存状态
-      coin.direction = res.direction;
-      coin.direction_updated_at = nowTs;
-      coin.current_volatility = res.currentVolatility;
-      coin.volatility_status = res.volatilityStatus;
-      coin.period_start_time = currentPeriodStart;
-      coin.cur_open = snapshotPrice;
-      coin.cur_high = snapshotPrice;
-      coin.cur_low = snapshotPrice;
-      coin.cur_close = snapshotPrice;
-      coin.prev1_open = prev1Open;
-      coin.prev1_close = prev1Close;
-      coin.prev1_high = prev1High;
-      coin.prev1_low = prev1Low;
-      coin.prev2_high = prev2High;
-      coin.prev2_low = prev2Low;
-
-      updatesList.push({
-        symbol: coin.symbol,
-        updates: {
-          direction: res.direction,
-          direction_updated_at: nowTs,
-          current_volatility: res.currentVolatility,
-          volatility_status: res.volatilityStatus,
-          period_start_time: currentPeriodStart,
-          cur_open: snapshotPrice,
-          cur_high: snapshotPrice,
-          cur_low: snapshotPrice,
-          cur_close: snapshotPrice,
-          prev1_open: prev1Open,
-          prev1_close: prev1Close,
-          prev1_high: prev1High,
-          prev1_low: prev1Low,
-          prev2_high: prev2High,
-          prev2_low: prev2Low,
-        },
-      });
-
-      logsList.push({
-        type: 'direction',
-        message: res.logMessage,
-      });
-    } else {
-      // 处于同一周期内：累计更新当前周期内部的最高、最低与最新收盘价
-      const newHigh = Math.max(coin.cur_high || snapshotPrice, snapshotPrice);
-      const newLow = Math.min(coin.cur_low || snapshotPrice, snapshotPrice);
-
-      coin.cur_high = newHigh;
-      coin.cur_low = newLow;
-      coin.cur_close = snapshotPrice;
-
-      updatesList.push({
-        symbol: coin.symbol,
-        updates: {
-          cur_high: newHigh,
-          cur_low: newLow,
-          cur_close: snapshotPrice,
-        },
-      });
-    }
-  }
-
-  // 3. 一次性批量持久化入库，极速完成
-  if (updatesList.length > 0) {
-    await batchUpdateCoinPairs(env, updatesList);
-  }
-  if (logsList.length > 0) {
-    await batchInsertSystemLogs(env, logsList);
-  }
-}
-
-/**
- * 精准拉取该币种对应周期的官方真实历史 K 线（前两根已封线 K 线）
- * 仅在新增币对、更新周期或初次启动时单次调用，彻底杜绝 24h 全天假极值！
- */
-export async function fetchExactPeriodCandles(
-  client: OKXClient,
-  instId: string,
-  bar: string
-): Promise<{
-  prev1Open: number;
-  prev1Close: number;
-  prev1High: number;
-  prev1Low: number;
-  prev2High: number;
-  prev2Low: number;
-} | null> {
-  try {
-    const candles = await client.getCandles(instId, bar, 4);
-    if (candles && candles.length >= 3) {
-      const c1 = candles[1];
-      const c2 = candles[2];
-      const o1 = parseFloat(String(c1.o ?? (c1 as any).open ?? 0));
-      const c1Val = parseFloat(String(c1.c ?? (c1 as any).close ?? 0));
-      const h1 = parseFloat(String(c1.h ?? (c1 as any).high ?? 0));
-      const l1 = parseFloat(String(c1.l ?? (c1 as any).low ?? 0));
-      const h2 = parseFloat(String(c2.h ?? (c2 as any).high ?? 0));
-      const l2 = parseFloat(String(c2.l ?? (c2 as any).low ?? 0));
-
-      if (o1 > 0 && c1Val > 0 && h1 > 0 && l1 > 0) {
-        return {
-          prev1Open: o1,
-          prev1Close: c1Val,
-          prev1High: h1,
-          prev1Low: l1,
-          prev2High: h2 > 0 ? h2 : h1,
-          prev2Low: l2 > 0 ? l2 : l1,
-        };
-      }
-    }
-  } catch (err) {
-    console.warn(`[fetchExactPeriodCandles] 获取 ${instId} (${bar}) 官方K线异常:`, err);
-  }
-  return null;
-}
-
-/**
- * 计算单个币种方向（用于新增/修改周期时，精准拉取对应周期的真实官方K线进行校准）
- */
-export async function calculateSingleDirection(
-  client: OKXClient,
-  coin: CoinPair,
-  reason: 'scheduled' | 'immediate' = 'immediate',
-  tickerMap?: Map<string, OKXTicker>
-): Promise<DirectionCalculationResult> {
-  const parsed = parsePeriod(coin.period) || { value: 1, unit: 'h', bar: '1H', periodMs: 3600000, displayName: '1h' };
-  const okxBar = getOkxBar(parsed);
-  const instId = formatInstId(coin.symbol);
-
-  // 1. 优先拉取该自定义周期的官方真实历史 K 线（前两根已封线 K 线）
-  const exact = await fetchExactPeriodCandles(client, instId, okxBar);
-  if (exact) {
-    return evaluateHistoricalPeriod(
-      coin,
-      okxBar,
-      exact.prev1Open,
-      exact.prev1Close,
-      exact.prev1High,
-      exact.prev1Low,
-      exact.prev2High,
-      exact.prev2Low,
-      reason
-    );
-  }
-
-  // 2. 兜底逻辑：若接口未返回，优先使用内存已存的历史极值，绝不拿全天24h假数据冒充
-  let ticker: OKXTicker | undefined;
-  if (tickerMap && tickerMap.has(instId)) {
-    ticker = tickerMap.get(instId);
-  } else if (tickerMap && tickerMap.has(coin.symbol)) {
-    ticker = tickerMap.get(coin.symbol);
-  } else {
-    try {
-      ticker = await client.getTicker(instId);
-    } catch {
-      ticker = undefined;
-    }
-  }
-
-  const snapshotPrice = ticker?.last ? parseFloat(ticker.last) : (coin.cur_close || 1);
-  const prev1Open = coin.prev1_open && coin.prev1_open > 0 ? coin.prev1_open : snapshotPrice;
-  const prev1Close = coin.prev1_close && coin.prev1_close > 0 ? coin.prev1_close : snapshotPrice;
-  const prev1High = coin.prev1_high && coin.prev1_high > 0 ? coin.prev1_high : snapshotPrice;
-  const prev1Low = coin.prev1_low && coin.prev1_low > 0 ? coin.prev1_low : snapshotPrice;
-  const prev2High = coin.prev2_high && coin.prev2_high > 0 ? coin.prev2_high : prev1High;
-  const prev2Low = coin.prev2_low && coin.prev2_low > 0 ? coin.prev2_low : prev1Low;
-
-  return evaluateHistoricalPeriod(
-    coin,
-    okxBar,
-    prev1Open,
-    prev1Close,
-    prev1High,
-    prev1Low,
-    prev2High,
-    prev2Low,
-    reason
-  );
-}
-
-/**
- * 刷新单个币种方向（精准校准，更新内存并同步写入 D1 数据库）
- */
-export async function refreshCoinDirection(
-  client: OKXClient,
-  env: Env,
-  coin: CoinPair,
-  reason: 'scheduled' | 'immediate' = 'immediate',
-  tickerMap?: Map<string, OKXTicker>
-): Promise<'long' | 'short'> {
-  const res = await calculateSingleDirection(client, coin, reason, tickerMap);
-
-  const nowTs = Date.now();
-  const parsed = parsePeriod(coin.period) || { value: 1, unit: 'h', bar: '1H', periodMs: 3600000, displayName: '1h' };
+function isPeriodBoundary(nowTs: number, parsed: ParsedPeriod, lastUpdatedTs: number): boolean {
+  if (lastUpdatedTs === 0) return true;
   const currentPeriodStart = getPeriodStart(nowTs, parsed);
-
-  coin.direction = res.direction;
-  coin.direction_updated_at = nowTs;
-  coin.current_volatility = res.currentVolatility;
-  coin.volatility_status = res.volatilityStatus;
-  coin.period_start_time = currentPeriodStart;
-  coin.cur_open = res.prev1Close;
-  coin.cur_high = res.prev1Close;
-  coin.cur_low = res.prev1Close;
-  coin.cur_close = res.prev1Close;
-  coin.prev1_open = res.prev1Open;
-  coin.prev1_close = res.prev1Close;
-  coin.prev1_high = res.prev1High;
-  coin.prev1_low = res.prev1Low;
-  coin.prev2_high = res.prev2High;
-  coin.prev2_low = res.prev2Low;
-
-  await updateCoinPair(env, coin.symbol, {
-    direction: res.direction,
-    direction_updated_at: nowTs,
-    current_volatility: res.currentVolatility,
-    volatility_status: res.volatilityStatus,
-    period_start_time: currentPeriodStart,
-    cur_open: res.prev1Close,
-    cur_high: res.prev1Close,
-    cur_low: res.prev1Close,
-    cur_close: res.prev1Close,
-    prev1_open: res.prev1Open,
-    prev1_close: res.prev1Close,
-    prev1_high: res.prev1High,
-    prev1_low: res.prev1Low,
-    prev2_high: res.prev2High,
-    prev2_low: res.prev2Low,
-  });
-
-  await insertSystemLog(env, 'direction', res.logMessage);
-  return res.direction;
+  const lastUpdatedPeriodStart = getPeriodStart(lastUpdatedTs, parsed);
+  return currentPeriodStart > lastUpdatedPeriodStart;
 }

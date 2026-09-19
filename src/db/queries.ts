@@ -1,5 +1,5 @@
 import { getDB } from './connection';
-import type { Config, CoinPair, Position, TradeLog, SystemLog } from '../types';
+import type { Config, CoinPair, Position, TradeLog, SystemLog, TimeoutUnit } from '../types';
 import { DEFAULT_CONFIG } from '../constants';
 
 let schemaEnsured = false;
@@ -26,17 +26,19 @@ export async function ensureDbSchema(env: Env): Promise<void> {
         direction_updated_at INTEGER DEFAULT 0,
         enabled INTEGER DEFAULT 0,
         funding_amount REAL DEFAULT 0,
-        funding_slices INTEGER DEFAULT 10,
         last_open_time INTEGER DEFAULT 0,
         next_jitter_ms INTEGER DEFAULT 0,
         pause_open INTEGER DEFAULT 0,
         leverage INTEGER DEFAULT 10,
         tp_ratio REAL DEFAULT 5,
         sl_ratio REAL DEFAULT 5,
+        timeout_value INTEGER DEFAULT 4,
+        timeout_unit TEXT DEFAULT 'hour',
         open_interval_value INTEGER DEFAULT 1,
         open_interval_unit TEXT DEFAULT 'hour',
         margin_mode TEXT DEFAULT 'isolated',
         profit_transfer_ratio REAL DEFAULT 0,
+        disable_timeout INTEGER DEFAULT 0,
         smart_volatility_enabled INTEGER DEFAULT 0,
         min_volatility_threshold REAL DEFAULT 1.0,
         current_volatility REAL DEFAULT 0,
@@ -104,7 +106,6 @@ export async function ensureDbSchema(env: Env): Promise<void> {
 
     const cols = [
       { name: 'funding_amount', type: 'REAL DEFAULT 0' },
-      { name: 'funding_slices', type: 'INTEGER DEFAULT 10' },
       { name: 'last_open_time', type: 'INTEGER DEFAULT 0' },
       { name: 'next_jitter_ms', type: 'INTEGER DEFAULT 0' },
       { name: 'leverage', type: 'INTEGER' },
@@ -113,24 +114,16 @@ export async function ensureDbSchema(env: Env): Promise<void> {
       { name: 'pause_open', type: 'INTEGER DEFAULT 0' },
       { name: 'tp_ratio', type: 'REAL' },
       { name: 'sl_ratio', type: 'REAL' },
+      { name: 'timeout_value', type: 'INTEGER' },
+      { name: 'timeout_unit', type: 'TEXT' },
       { name: 'margin_mode', type: 'TEXT' },
       { name: 'profit_transfer_ratio', type: 'REAL' },
+      { name: 'disable_timeout', type: 'INTEGER DEFAULT 0' },
       { name: 'smart_volatility_enabled', type: 'INTEGER DEFAULT 0' },
       { name: 'min_volatility_threshold', type: 'REAL DEFAULT 1.0' },
       { name: 'current_volatility', type: 'REAL DEFAULT 0' },
       { name: 'volatility_status', type: 'TEXT DEFAULT "active"' },
       { name: 'add_pos_ratio', type: 'REAL DEFAULT 0' },
-      { name: 'period_start_time', type: 'INTEGER DEFAULT 0' },
-      { name: 'cur_open', type: 'REAL' },
-      { name: 'cur_high', type: 'REAL' },
-      { name: 'cur_low', type: 'REAL' },
-      { name: 'cur_close', type: 'REAL' },
-      { name: 'prev1_open', type: 'REAL' },
-      { name: 'prev1_close', type: 'REAL' },
-      { name: 'prev1_high', type: 'REAL' },
-      { name: 'prev1_low', type: 'REAL' },
-      { name: 'prev2_high', type: 'REAL' },
-      { name: 'prev2_low', type: 'REAL' },
     ];
     for (const c of cols) {
       if (!existingCols.has(c.name)) {
@@ -275,40 +268,31 @@ export async function getCoinPairs(env: Env): Promise<CoinPair[]> {
   const db = getDB(env);
   const rows = await db
     .prepare(
-      'SELECT symbol, period, direction, direction_updated_at, enabled, COALESCE(funding_amount, 0) as funding_amount, COALESCE(funding_slices, 10) as funding_slices, COALESCE(last_open_time, 0) as last_open_time, COALESCE(next_jitter_ms, 0) as next_jitter_ms, leverage, open_interval_value, open_interval_unit, COALESCE(pause_open, 0) as pause_open, tp_ratio, sl_ratio, margin_mode, profit_transfer_ratio, COALESCE(smart_volatility_enabled, 0) as smart_volatility_enabled, COALESCE(min_volatility_threshold, 1.0) as min_volatility_threshold, COALESCE(current_volatility, 0) as current_volatility, COALESCE(volatility_status, "active") as volatility_status, COALESCE(add_pos_ratio, 0) as add_pos_ratio, period_start_time, cur_open, cur_high, cur_low, cur_close, prev1_open, prev1_close, prev1_high, prev1_low, prev2_high, prev2_low FROM coin_pairs'
+      'SELECT symbol, period, direction, direction_updated_at, enabled, COALESCE(funding_amount, 0) as funding_amount, COALESCE(last_open_time, 0) as last_open_time, COALESCE(next_jitter_ms, 0) as next_jitter_ms, leverage, open_interval_value, open_interval_unit, COALESCE(pause_open, 0) as pause_open, tp_ratio, sl_ratio, timeout_value, timeout_unit, margin_mode, profit_transfer_ratio, COALESCE(disable_timeout, 0) as disable_timeout, COALESCE(smart_volatility_enabled, 0) as smart_volatility_enabled, COALESCE(min_volatility_threshold, 1.0) as min_volatility_threshold, COALESCE(current_volatility, 0) as current_volatility, COALESCE(volatility_status, "active") as volatility_status, COALESCE(add_pos_ratio, 0) as add_pos_ratio FROM coin_pairs'
     )
-    .all() as { results: any[] };
+    .all() as { results: CoinPair[] };
   const mapped = rows.results.map((r) => ({
     ...r,
     enabled: Boolean(r.enabled),
     pause_open: Boolean(r.pause_open),
+    disable_timeout: Boolean(r.disable_timeout),
     smart_volatility_enabled: Boolean(r.smart_volatility_enabled),
     min_volatility_threshold: r.min_volatility_threshold !== undefined && r.min_volatility_threshold !== null ? r.min_volatility_threshold : 1.0,
     current_volatility: r.current_volatility !== undefined && r.current_volatility !== null ? r.current_volatility : 0,
     volatility_status: r.volatility_status || 'active',
     add_pos_ratio: r.add_pos_ratio !== undefined && r.add_pos_ratio !== null ? r.add_pos_ratio : null,
     funding_amount: r.funding_amount || 0,
-    funding_slices: r.funding_slices !== undefined && r.funding_slices !== null ? r.funding_slices : 10,
     last_open_time: r.last_open_time || 0,
     next_jitter_ms: r.next_jitter_ms || 0,
     leverage: r.leverage !== undefined && r.leverage !== null ? r.leverage : null,
     tp_ratio: r.tp_ratio !== undefined && r.tp_ratio !== null ? r.tp_ratio : null,
     sl_ratio: r.sl_ratio !== undefined && r.sl_ratio !== null ? r.sl_ratio : null,
+    timeout_value: r.timeout_value !== undefined && r.timeout_value !== null ? r.timeout_value : null,
+    timeout_unit: r.timeout_unit || null,
     open_interval_value: r.open_interval_value !== undefined && r.open_interval_value !== null ? r.open_interval_value : null,
     open_interval_unit: r.open_interval_unit || null,
     margin_mode: r.margin_mode || null,
     profit_transfer_ratio: r.profit_transfer_ratio !== undefined && r.profit_transfer_ratio !== null ? r.profit_transfer_ratio : null,
-    period_start_time: r.period_start_time !== undefined && r.period_start_time !== null ? r.period_start_time : 0,
-    cur_open: r.cur_open !== undefined && r.cur_open !== null ? r.cur_open : null,
-    cur_high: r.cur_high !== undefined && r.cur_high !== null ? r.cur_high : null,
-    cur_low: r.cur_low !== undefined && r.cur_low !== null ? r.cur_low : null,
-    cur_close: r.cur_close !== undefined && r.cur_close !== null ? r.cur_close : null,
-    prev1_open: r.prev1_open !== undefined && r.prev1_open !== null ? r.prev1_open : null,
-    prev1_close: r.prev1_close !== undefined && r.prev1_close !== null ? r.prev1_close : null,
-    prev1_high: r.prev1_high !== undefined && r.prev1_high !== null ? r.prev1_high : null,
-    prev1_low: r.prev1_low !== undefined && r.prev1_low !== null ? r.prev1_low : null,
-    prev2_high: r.prev2_high !== undefined && r.prev2_high !== null ? r.prev2_high : null,
-    prev2_low: r.prev2_low !== undefined && r.prev2_low !== null ? r.prev2_low : null,
   }));
   coinPairsMemoryCache = { data: mapped, timestamp: now };
   return mapped.map(c => ({ ...c }));
@@ -334,7 +318,6 @@ export async function batchUpdateCoinPairs(
     if (u.pause_open !== undefined) { sets.push('pause_open = ?'); values.push(u.pause_open ? 1 : 0); }
     if (u.period !== undefined) { sets.push('period = ?'); values.push(u.period); }
     if (u.funding_amount !== undefined) { sets.push('funding_amount = ?'); values.push(u.funding_amount); }
-    if (u.funding_slices !== undefined) { sets.push('funding_slices = ?'); values.push(u.funding_slices); }
     if (u.last_open_time !== undefined) { sets.push('last_open_time = ?'); values.push(u.last_open_time); }
     if (u.next_jitter_ms !== undefined) { sets.push('next_jitter_ms = ?'); values.push(u.next_jitter_ms); }
     if (u.leverage !== undefined) { sets.push('leverage = ?'); values.push(u.leverage); }
@@ -342,24 +325,16 @@ export async function batchUpdateCoinPairs(
     if (u.open_interval_unit !== undefined) { sets.push('open_interval_unit = ?'); values.push(u.open_interval_unit); }
     if (u.tp_ratio !== undefined) { sets.push('tp_ratio = ?'); values.push(u.tp_ratio); }
     if (u.sl_ratio !== undefined) { sets.push('sl_ratio = ?'); values.push(u.sl_ratio); }
+    if (u.timeout_value !== undefined) { sets.push('timeout_value = ?'); values.push(u.timeout_value); }
+    if (u.timeout_unit !== undefined) { sets.push('timeout_unit = ?'); values.push(u.timeout_unit); }
     if (u.margin_mode !== undefined) { sets.push('margin_mode = ?'); values.push(u.margin_mode); }
     if (u.profit_transfer_ratio !== undefined) { sets.push('profit_transfer_ratio = ?'); values.push(u.profit_transfer_ratio); }
+    if (u.disable_timeout !== undefined) { sets.push('disable_timeout = ?'); values.push(u.disable_timeout ? 1 : 0); }
     if (u.smart_volatility_enabled !== undefined) { sets.push('smart_volatility_enabled = ?'); values.push(u.smart_volatility_enabled ? 1 : 0); }
     if (u.min_volatility_threshold !== undefined) { sets.push('min_volatility_threshold = ?'); values.push(u.min_volatility_threshold); }
     if (u.current_volatility !== undefined) { sets.push('current_volatility = ?'); values.push(u.current_volatility); }
     if (u.volatility_status !== undefined) { sets.push('volatility_status = ?'); values.push(u.volatility_status); }
     if (u.add_pos_ratio !== undefined) { sets.push('add_pos_ratio = ?'); values.push(u.add_pos_ratio); }
-    if (u.period_start_time !== undefined) { sets.push('period_start_time = ?'); values.push(u.period_start_time); }
-    if (u.cur_open !== undefined) { sets.push('cur_open = ?'); values.push(u.cur_open); }
-    if (u.cur_high !== undefined) { sets.push('cur_high = ?'); values.push(u.cur_high); }
-    if (u.cur_low !== undefined) { sets.push('cur_low = ?'); values.push(u.cur_low); }
-    if (u.cur_close !== undefined) { sets.push('cur_close = ?'); values.push(u.cur_close); }
-    if (u.prev1_open !== undefined) { sets.push('prev1_open = ?'); values.push(u.prev1_open); }
-    if (u.prev1_close !== undefined) { sets.push('prev1_close = ?'); values.push(u.prev1_close); }
-    if (u.prev1_high !== undefined) { sets.push('prev1_high = ?'); values.push(u.prev1_high); }
-    if (u.prev1_low !== undefined) { sets.push('prev1_low = ?'); values.push(u.prev1_low); }
-    if (u.prev2_high !== undefined) { sets.push('prev2_high = ?'); values.push(u.prev2_high); }
-    if (u.prev2_low !== undefined) { sets.push('prev2_low = ?'); values.push(u.prev2_low); }
 
     if (sets.length > 0) {
       values.push(item.symbol);
@@ -438,9 +413,13 @@ export async function updateCoinPair(
     sets.push('sl_ratio = ?');
     values.push(updates.sl_ratio);
   }
-  if (updates.funding_slices !== undefined) {
-    sets.push('funding_slices = ?');
-    values.push(updates.funding_slices);
+  if (updates.timeout_value !== undefined) {
+    sets.push('timeout_value = ?');
+    values.push(updates.timeout_value);
+  }
+  if (updates.timeout_unit !== undefined) {
+    sets.push('timeout_unit = ?');
+    values.push(updates.timeout_unit);
   }
   if (updates.margin_mode !== undefined) {
     sets.push('margin_mode = ?');
@@ -449,6 +428,10 @@ export async function updateCoinPair(
   if (updates.profit_transfer_ratio !== undefined) {
     sets.push('profit_transfer_ratio = ?');
     values.push(updates.profit_transfer_ratio);
+  }
+  if (updates.disable_timeout !== undefined) {
+    sets.push('disable_timeout = ?');
+    values.push(updates.disable_timeout ? 1 : 0);
   }
   if (updates.smart_volatility_enabled !== undefined) {
     sets.push('smart_volatility_enabled = ?');
@@ -470,50 +453,6 @@ export async function updateCoinPair(
     sets.push('add_pos_ratio = ?');
     values.push(updates.add_pos_ratio);
   }
-  if (updates.period_start_time !== undefined) {
-    sets.push('period_start_time = ?');
-    values.push(updates.period_start_time);
-  }
-  if (updates.cur_open !== undefined) {
-    sets.push('cur_open = ?');
-    values.push(updates.cur_open);
-  }
-  if (updates.cur_high !== undefined) {
-    sets.push('cur_high = ?');
-    values.push(updates.cur_high);
-  }
-  if (updates.cur_low !== undefined) {
-    sets.push('cur_low = ?');
-    values.push(updates.cur_low);
-  }
-  if (updates.cur_close !== undefined) {
-    sets.push('cur_close = ?');
-    values.push(updates.cur_close);
-  }
-  if (updates.prev1_open !== undefined) {
-    sets.push('prev1_open = ?');
-    values.push(updates.prev1_open);
-  }
-  if (updates.prev1_close !== undefined) {
-    sets.push('prev1_close = ?');
-    values.push(updates.prev1_close);
-  }
-  if (updates.prev1_high !== undefined) {
-    sets.push('prev1_high = ?');
-    values.push(updates.prev1_high);
-  }
-  if (updates.prev1_low !== undefined) {
-    sets.push('prev1_low = ?');
-    values.push(updates.prev1_low);
-  }
-  if (updates.prev2_high !== undefined) {
-    sets.push('prev2_high = ?');
-    values.push(updates.prev2_high);
-  }
-  if (updates.prev2_low !== undefined) {
-    sets.push('prev2_low = ?');
-    values.push(updates.prev2_low);
-  }
 
   if (sets.length === 0) return;
 
@@ -531,112 +470,20 @@ export async function addCoinPair(env: Env, symbol: string, period?: string): Pr
     .prepare(`
       INSERT OR IGNORE INTO coin_pairs (
         symbol, period, direction, direction_updated_at, enabled,
-        funding_amount, funding_slices, last_open_time, next_jitter_ms, pause_open,
-        leverage, tp_ratio, sl_ratio,
-        open_interval_value, open_interval_unit, margin_mode, profit_transfer_ratio
-      ) VALUES (?, ?, NULL, 0, 0, 0, 10, 0, 0, 0, 10, 5, 5, 1, 'hour', 'isolated', 0)
+        funding_amount, last_open_time, next_jitter_ms, pause_open,
+        leverage, tp_ratio, sl_ratio, timeout_value, timeout_unit,
+        open_interval_value, open_interval_unit, margin_mode, profit_transfer_ratio, disable_timeout
+      ) VALUES (?, ?, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0)
     `)
     .bind(symbol, period || '')
     .run();
   invalidateCoinPairsCache();
 }
 
-export async function batchAddCoinPairs(
-  env: Env,
-  items: Array<{
-    symbol: string;
-    period?: string;
-    funding_amount?: number;
-    funding_slices?: number;
-    enabled?: number;
-    last_open_time?: number;
-    leverage?: number;
-    open_interval_value?: number;
-    open_interval_unit?: string;
-    tp_ratio?: number;
-    sl_ratio?: number;
-    margin_mode?: string;
-    profit_transfer_ratio?: number;
-    smart_volatility_enabled?: number;
-    min_volatility_threshold?: number;
-    add_pos_ratio?: number;
-  }>
-): Promise<void> {
-  if (!items || items.length === 0) return;
-  await ensureDbSchema(env);
-  const db = getDB(env);
-  const stmts = items.map((item) =>
-    db
-      .prepare(`
-        INSERT INTO coin_pairs (
-          symbol, period, direction, direction_updated_at, enabled,
-          funding_amount, funding_slices, last_open_time, next_jitter_ms, pause_open,
-          leverage, tp_ratio, sl_ratio,
-          open_interval_value, open_interval_unit, margin_mode, profit_transfer_ratio,
-          smart_volatility_enabled, min_volatility_threshold, add_pos_ratio
-        ) VALUES (?, ?, NULL, 0, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(symbol) DO UPDATE SET
-          period = CASE WHEN excluded.period != '' THEN excluded.period ELSE coin_pairs.period END,
-          funding_amount = COALESCE(excluded.funding_amount, coin_pairs.funding_amount),
-          funding_slices = COALESCE(excluded.funding_slices, coin_pairs.funding_slices),
-          leverage = COALESCE(excluded.leverage, coin_pairs.leverage),
-          open_interval_value = COALESCE(excluded.open_interval_value, coin_pairs.open_interval_value),
-          open_interval_unit = COALESCE(excluded.open_interval_unit, coin_pairs.open_interval_unit),
-          tp_ratio = COALESCE(excluded.tp_ratio, coin_pairs.tp_ratio),
-          sl_ratio = COALESCE(excluded.sl_ratio, coin_pairs.sl_ratio),
-          margin_mode = COALESCE(excluded.margin_mode, coin_pairs.margin_mode),
-          profit_transfer_ratio = COALESCE(excluded.profit_transfer_ratio, coin_pairs.profit_transfer_ratio),
-          smart_volatility_enabled = COALESCE(excluded.smart_volatility_enabled, coin_pairs.smart_volatility_enabled),
-          min_volatility_threshold = COALESCE(excluded.min_volatility_threshold, coin_pairs.min_volatility_threshold),
-          add_pos_ratio = COALESCE(excluded.add_pos_ratio, coin_pairs.add_pos_ratio),
-          enabled = CASE WHEN excluded.enabled = 1 THEN 1 ELSE coin_pairs.enabled END,
-          last_open_time = CASE WHEN excluded.enabled = 1 THEN 0 ELSE coin_pairs.last_open_time END
-      `)
-      .bind(
-        item.symbol,
-        item.period || '',
-        item.enabled ? 1 : 0,
-        item.funding_amount !== undefined ? item.funding_amount : 0,
-        item.funding_slices !== undefined ? item.funding_slices : 10,
-        item.last_open_time !== undefined ? item.last_open_time : 0,
-        item.leverage !== undefined ? item.leverage : 10,
-        item.tp_ratio !== undefined ? item.tp_ratio : 5,
-        item.sl_ratio !== undefined ? item.sl_ratio : 5,
-        item.open_interval_value !== undefined ? item.open_interval_value : 1,
-        item.open_interval_unit || 'hour',
-        item.margin_mode || 'isolated',
-        item.profit_transfer_ratio !== undefined ? item.profit_transfer_ratio : 0,
-        item.smart_volatility_enabled ? 1 : 0,
-        item.min_volatility_threshold !== undefined ? item.min_volatility_threshold : 1.0,
-        item.add_pos_ratio !== undefined ? item.add_pos_ratio : 0
-      )
-  );
-
-  for (let i = 0; i < stmts.length; i += 80) {
-    await db.batch(stmts.slice(i, i + 80));
-  }
-  invalidateCoinPairsCache();
-}
-
 export async function deleteCoinPair(env: Env, symbol: string): Promise<void> {
   const db = getDB(env);
-  const cleanSymbol = (symbol || '').trim().toUpperCase();
-  await db.prepare('DELETE FROM coin_pairs WHERE symbol = ?').bind(cleanSymbol).run();
+  await db.prepare('DELETE FROM coin_pairs WHERE symbol = ?').bind(symbol).run();
   invalidateCoinPairsCache();
-}
-
-export async function batchDeleteCoinPairs(env: Env, symbols: string[]): Promise<number> {
-  if (!symbols || symbols.length === 0) return 0;
-  const db = getDB(env);
-  const cleanSymbols = Array.from(new Set(symbols.map(s => (s || '').trim().toUpperCase()))).filter(Boolean);
-  if (cleanSymbols.length === 0) return 0;
-
-  const stmts = cleanSymbols.map(s => db.prepare('DELETE FROM coin_pairs WHERE symbol = ?').bind(s));
-  for (let i = 0; i < stmts.length; i += 80) {
-    await db.batch(stmts.slice(i, i + 80));
-  }
-  invalidateCoinPairsCache();
-  return cleanSymbols.length;
 }
 
 export async function getOpenPositions(env: Env): Promise<Position[]> {
@@ -737,102 +584,6 @@ export async function batchInsertPositions(
     }
   }
   return ids;
-}
-
-/**
- * 聚合持仓批量更新/写入（全仓模式单币种单一活跃仓位）
- * 彻底消除高频重复插入订单记录，仅维护每个币种方向唯一的活跃仓位记录
- */
-export async function batchUpsertAggregatedPositions(
-  env: Env,
-  orders: Array<Omit<Position, 'id'> | {
-    symbol: string;
-    direction: 'long' | 'short';
-    leverage: number;
-    entry_price: number;
-    quantity: number;
-    margin: number;
-    okx_order_id?: string;
-    open_time: number;
-    tp_price: number;
-    sl_price: number;
-    tp_algo_id?: string;
-    sl_algo_id?: string;
-    last_price: number;
-  }>
-): Promise<void> {
-  if (orders.length === 0) return;
-  await ensureDbSchema(env);
-  const db = getDB(env);
-
-  const openPositions = await getOpenPositions(env);
-  const openMap = new Map<string, Position>();
-  for (const pos of openPositions) {
-    openMap.set(`${pos.symbol}:${pos.direction}`, pos);
-  }
-
-  const stmts: any[] = [];
-
-  for (const ord of orders) {
-    const key = `${ord.symbol}:${ord.direction}`;
-    const existing = openMap.get(key);
-
-    if (existing) {
-      const newQty = existing.quantity + ord.quantity;
-      const newMargin = existing.margin + ord.margin;
-      const newAvgEntry = newQty > 0
-        ? (existing.entry_price * existing.quantity + ord.entry_price * ord.quantity) / newQty
-        : ord.entry_price;
-
-      existing.quantity = newQty;
-      existing.margin = newMargin;
-      existing.entry_price = newAvgEntry;
-      existing.last_price = ord.last_price || ord.entry_price;
-
-      stmts.push(
-        db
-          .prepare(
-            `UPDATE positions 
-             SET quantity = ?, margin = ?, entry_price = ?, last_price = ?, okx_order_id = ?
-             WHERE id = ? AND status = 'open'`
-          )
-          .bind(newQty, newMargin, newAvgEntry, ord.last_price || ord.entry_price, ord.okx_order_id || existing.okx_order_id, existing.id)
-      );
-    } else {
-      stmts.push(
-        db
-          .prepare(
-            `INSERT INTO positions (
-               symbol, direction, leverage, entry_price, quantity, margin, 
-               okx_order_id, open_time, tp_price, sl_price, tp_algo_id, sl_algo_id, 
-               unrealized_pnl, last_price, status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`
-          )
-          .bind(
-            ord.symbol,
-            ord.direction,
-            ord.leverage,
-            ord.entry_price,
-            ord.quantity,
-            ord.margin,
-            ord.okx_order_id || '',
-            ord.open_time,
-            ord.tp_price || 0,
-            ord.sl_price || 0,
-            ord.tp_algo_id || '',
-            ord.sl_algo_id || '',
-            0,
-            ord.last_price || ord.entry_price
-          )
-      );
-    }
-  }
-
-  if (stmts.length > 0) {
-    for (let i = 0; i < stmts.length; i += 80) {
-      await db.batch(stmts.slice(i, i + 80));
-    }
-  }
 }
 
 export async function closePositionRecord(
@@ -1220,63 +971,5 @@ export async function resetEntireDatabase(env: Env, preservedPasswordHash?: stri
   await db.batch(initStmts);
   invalidateConfigCache();
   invalidateCoinPairsCache();
-}
-
-export interface GlobalCoinParams {
-  leverage: number;
-  open_interval_value: number;
-  open_interval_unit: string;
-  tp_ratio: number;
-  sl_ratio: number;
-  funding_slices: number;
-  margin_mode: string;
-  profit_transfer_ratio: number;
-  smart_volatility_enabled: number;
-  min_volatility_threshold: number;
-  add_pos_ratio: number;
-}
-
-export const DEFAULT_GLOBAL_PARAMS: GlobalCoinParams = {
-  leverage: 10,
-  open_interval_value: 1,
-  open_interval_unit: 'hour',
-  tp_ratio: 5,
-  sl_ratio: 5,
-  funding_slices: 10,
-  margin_mode: 'isolated',
-  profit_transfer_ratio: 0,
-  smart_volatility_enabled: 0,
-  min_volatility_threshold: 1.0,
-  add_pos_ratio: 0,
-};
-
-export async function getGlobalDefaultParams(env: Env): Promise<GlobalCoinParams> {
-  try {
-    await ensureDbSchema(env);
-    const db = getDB(env);
-    const row = await db.prepare("SELECT value FROM config WHERE key = 'global_default_params'").first<{ value: string }>();
-    if (row && row.value) {
-      const parsed = JSON.parse(row.value);
-      return { ...DEFAULT_GLOBAL_PARAMS, ...parsed };
-    }
-  } catch (err) {
-    console.warn('[DB] getGlobalDefaultParams fallback:', err);
-  }
-  return { ...DEFAULT_GLOBAL_PARAMS };
-}
-
-export async function setGlobalDefaultParams(env: Env, params: Partial<GlobalCoinParams>): Promise<GlobalCoinParams> {
-  const current = await getGlobalDefaultParams(env);
-  const updated: GlobalCoinParams = { ...current, ...params };
-  await ensureDbSchema(env);
-  const db = getDB(env);
-  const jsonStr = JSON.stringify(updated);
-  const now = Date.now();
-  await db
-    .prepare("INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('global_default_params', ?, ?)")
-    .bind(jsonStr, now)
-    .run();
-  invalidateConfigCache('global_default_params');
-  return updated;
 }
 

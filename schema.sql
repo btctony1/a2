@@ -11,22 +11,23 @@ CREATE TABLE IF NOT EXISTS coin_pairs (
   direction_updated_at INTEGER DEFAULT 0,
   enabled INTEGER DEFAULT 0,
   funding_amount REAL DEFAULT 0,
-  funding_slices INTEGER DEFAULT 10,
   last_open_time INTEGER DEFAULT 0,
   next_jitter_ms INTEGER DEFAULT 0,
   pause_open INTEGER DEFAULT 0,
   leverage INTEGER DEFAULT 10,
   tp_ratio REAL DEFAULT 5,
   sl_ratio REAL DEFAULT 5,
+  timeout_value INTEGER DEFAULT 4,
+  timeout_unit TEXT DEFAULT 'hour',
   open_interval_value INTEGER DEFAULT 1,
   open_interval_unit TEXT DEFAULT 'hour',
   margin_mode TEXT DEFAULT 'isolated',
   profit_transfer_ratio REAL DEFAULT 0,
+  disable_timeout INTEGER DEFAULT 0,
   smart_volatility_enabled INTEGER DEFAULT 0,
   min_volatility_threshold REAL DEFAULT 1.0,
   current_volatility REAL DEFAULT 0,
-  volatility_status TEXT DEFAULT 'active',
-  add_pos_ratio REAL DEFAULT 0
+  volatility_status TEXT DEFAULT 'active'
 );
 
 CREATE TABLE IF NOT EXISTS positions (

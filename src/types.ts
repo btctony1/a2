@@ -15,34 +15,25 @@ export interface CoinPair {
   enabled: boolean;
   pause_open?: boolean;
   funding_amount: number;
-  funding_slices?: number | null;
   last_open_time?: number;
   next_jitter_ms?: number;
   
   leverage?: number | null;
   tp_ratio?: number | null;
   sl_ratio?: number | null;
+  timeout_value?: number | null;
+  timeout_unit?: TimeoutUnit | string | null;
   open_interval_value?: number | null;
   open_interval_unit?: TimeoutUnit | string | null;
   margin_mode?: 'isolated' | 'cross' | string | null;
   profit_transfer_ratio?: number | null;
+  disable_timeout?: boolean;
   smart_volatility_enabled?: boolean;
   min_volatility_threshold?: number;
   current_volatility?: number;
   volatility_status?: 'active' | 'paused' | string;
   add_pos_ratio?: number | null;
   last_price?: number;
-  period_start_time?: number | null;
-  cur_open?: number | null;
-  cur_high?: number | null;
-  cur_low?: number | null;
-  cur_close?: number | null;
-  prev1_open?: number | null;
-  prev1_close?: number | null;
-  prev1_high?: number | null;
-  prev1_low?: number | null;
-  prev2_high?: number | null;
-  prev2_low?: number | null;
 }
 
 export interface Position {
@@ -62,7 +53,7 @@ export interface Position {
   tp_algo_id: string;
   sl_algo_id: string;
   status: 'open' | 'closed';
-  close_reason?: 'tp' | 'sl' | 'manual';
+  close_reason?: 'tp' | 'sl' | 'timeout' | 'manual';
   close_price?: number;
   close_pnl?: number;
   close_time?: number;
@@ -142,7 +133,6 @@ export interface OKXClient {
   getCandles(symbol: string, bar: string, limit: number): Promise<OKXCandle[]>;
   getTicker(symbol: string): Promise<OKXTicker>;
   getTickersByType(instType?: string): Promise<Map<string, OKXTicker>>;
-  getTickersForSymbols(symbols: string[]): Promise<Map<string, OKXTicker>>;
   getBalance(): Promise<{ trade_account: number; fund_account: number }>;
   getPosMode(): Promise<'net_mode' | 'long_short_mode'>;
   setPosMode(mode: 'long_short_mode'): Promise<void>;
@@ -248,13 +238,9 @@ export interface AlgoOrderParams {
   sz?: string;
   closeFraction?: string;
   tpTriggerPx?: string;
-  tpTriggerPxType?: 'last' | 'mark' | 'index';
   tpOrdPx?: string;
   slTriggerPx?: string;
-  slTriggerPxType?: 'last' | 'mark' | 'index';
   slOrdPx?: string;
-  cxlOnClosePos?: boolean;
-  reduceOnly?: boolean;
   algoClOrdId?: string;
 }
 

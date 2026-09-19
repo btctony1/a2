@@ -2,54 +2,32 @@ name: Deploy to Cloudflare Workers
 
 on:
   push:
-    branches: [main, master]
-  schedule:
-    # 每 30 分钟自动触发一次工作流部署到 Cloudflare
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
-      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.API }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Validate Cloudflare Credentials
-        run: |
-          if [ -z "$CF_TOKEN" ]; then
-            echo "::error::未检测到 Cloudflare API Token！请前往 GitHub 仓库的 Settings -> Secrets and variables -> Actions 添加 Secret：名称为 API 或 CLOUDFLARE_API_TOKEN"
-            exit 1
-          fi
 
       - name: Sanitize names
         id: names
         run: |
           RAW="${{ secrets.QZ }}"
-          if [ -z "$RAW" ]; then
-            RAW="okx-auto-trader"
-          fi
           SAFE=$(echo "$RAW" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
-          if [ -z "$SAFE" ]; then
-            SAFE="okx-auto-trader"
-          fi
           echo "safe_qz=$SAFE" >> $GITHUB_OUTPUT
           echo "worker_name=$SAFE-worker" >> $GITHUB_OUTPUT
           echo "db_name=$SAFE-db" >> $GITHUB_OUTPUT
-          if [ -n "${{ secrets.YUM }}" ]; then
-            echo "domain=$SAFE.${{ secrets.YUM }}" >> $GITHUB_OUTPUT
-          else
-            echo "domain=" >> $GITHUB_OUTPUT
-          fi
+          echo "domain=$SAFE.${{ secrets.YUM }}" >> $GITHUB_OUTPUT
           echo "raw_qz=$RAW" >> $GITHUB_OUTPUT
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
 
       - name: Install dependencies
         run: npm install
@@ -60,12 +38,9 @@ jobs:
       - name: Get CF Account ID
         id: account
         run: |
-          ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
-          if [ -z "$ACCOUNT_ID" ]; then
-            ACCOUNT_ID=$(curl -s "https://api.cloudflare.com/client/v4/accounts" \
-              -H "Authorization: Bearer $CF_TOKEN" \
-              | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync(0,'utf8'));if(d&&d.result&&d.result[0])console.log(d.result[0].id);else{console.error('No Cloudflare account found');process.exit(1)}}catch(e){console.error('Failed to parse CF account:',e.message);process.exit(1)}")
-          fi
+          ACCOUNT_ID=$(curl -s "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer ${{ secrets.API }}" \
+            | node -e "const fs=require('fs');const d=JSON.parse(fs.readFileSync('/dev/stdin','utf8'));if(d&&d.result&&d.result[0])console.log(d.result[0].id);else{console.error('No Cloudflare account found');process.exit(1)}")
           echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
 
       - name: Enable workers.dev subdomain
@@ -73,46 +48,36 @@ jobs:
         run: |
           SUBDOMAIN="${{ steps.names.outputs.safe_qz }}"
           RESULT=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.account_id }}/workers/subdomain" \
-            -H "Authorization: Bearer $CF_TOKEN" \
+            -H "Authorization: Bearer ${{ secrets.API }}" \
             -H "Content-Type: application/json")
-          EXISTING=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).result?.subdomain||''")
-          FINAL_SUBDOMAIN="$SUBDOMAIN"
+          EXISTING=$(echo "$RESULT" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).result?.subdomain||''")
           if [ -n "$EXISTING" ]; then
             if [ "$EXISTING" != "$SUBDOMAIN" ]; then
-              echo "workers.dev subdomain exists as '$EXISTING', attempting to update to '$SUBDOMAIN'"
-              UPDATE_RES=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.account_id }}/workers/subdomain" \
-                -H "Authorization: Bearer $CF_TOKEN" \
+              echo "workers.dev subdomain exists as '$EXISTING', updating to '$SUBDOMAIN'"
+              RESULT=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.account_id }}/workers/subdomain" \
+                -H "Authorization: Bearer ${{ secrets.API }}" \
                 -H "Content-Type: application/json" \
                 -d "{\"subdomain\":\"$SUBDOMAIN\"}")
-              OK=$(echo "$UPDATE_RES" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).success||false")
-              if [ "$OK" = "true" ]; then
-                FINAL_SUBDOMAIN="$SUBDOMAIN"
-              else
-                echo "Subdomain '$SUBDOMAIN' unavailable or already allocated. Using existing account subdomain: '$EXISTING'"
-                FINAL_SUBDOMAIN="$EXISTING"
-              fi
             else
               echo "workers.dev subdomain '$SUBDOMAIN' is already enabled"
-              FINAL_SUBDOMAIN="$SUBDOMAIN"
             fi
           else
             echo "Enabling workers.dev subdomain: $SUBDOMAIN"
-            CREATE_RES=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.account_id }}/workers/subdomain" \
-              -H "Authorization: Bearer $CF_TOKEN" \
+            RESULT=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.account_id }}/workers/subdomain" \
+              -H "Authorization: Bearer ${{ secrets.API }}" \
               -H "Content-Type: application/json" \
               -d "{\"subdomain\":\"$SUBDOMAIN\"}")
-            FINAL_SUBDOMAIN=$(echo "$CREATE_RES" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).result?.subdomain||'$SUBDOMAIN'")
           fi
-          echo "final_subdomain=$FINAL_SUBDOMAIN" >> $GITHUB_OUTPUT
+          echo "$RESULT" | node -e "const fs=require('fs');const d=JSON.parse(fs.readFileSync('/dev/stdin','utf8'));console.log(d.success?'OK: '+(d.result?d.result.subdomain:'unknown'):'FAIL: '+(d.errors?JSON.stringify(d.errors):'unknown'))"
 
       - name: Create D1 Database
         id: d1
         run: |
           npx wrangler d1 create ${{ steps.names.outputs.db_name }} --location=apac 2>/dev/null || true
-          DB_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "const fs=require('fs');try{const raw=fs.readFileSync(0,'utf8');const s=raw.indexOf('[');const e=raw.lastIndexOf(']');const d=(s!==-1&&e!==-1)?JSON.parse(raw.slice(s,e+1)):JSON.parse(raw);const db=Array.isArray(d)?d.find(x=>x&&(x.name==='${{ steps.names.outputs.db_name }}'||x.database_name==='${{ steps.names.outputs.db_name }}')):null;const id=db?(db.uuid||db.id||db.database_id):null;if(id)console.log(id);else{console.error('D1 database not found');process.exit(1)}}catch(e){console.error('Failed to parse D1 list:',e.message);process.exit(1)}")
+          DB_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync('/dev/stdin','utf8'));const db=d.find(x=>x.name==='${{ steps.names.outputs.db_name }}');if(db)console.log(db.uuid);else{console.error('D1 database not found');process.exit(1)}}catch(e){console.error('Failed to parse D1 list:',e.message);process.exit(1)}")
           echo "database_id=$DB_ID" >> $GITHUB_OUTPUT
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.CF_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.API }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Update wrangler.toml
@@ -123,52 +88,40 @@ jobs:
 
       - name: Initialize D1 Schema
         run: |
-          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./schema.sql --remote --yes
+          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./schema.sql --remote
           sleep 5
-          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./seed.sql --remote --yes
+          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./seed.sql --remote
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.CF_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.API }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Run D1 Migrations
         run: |
-          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./migrate.sql --remote --yes || true
+          npx wrangler d1 execute ${{ steps.names.outputs.db_name }} --file=./migrate.sql --remote || true
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.CF_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.API }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Deploy Worker
         run: npx wrangler deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.CF_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.API }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Set Worker Secrets
         run: |
-          if [ -n "${{ secrets.OKX_API_KEY }}" ]; then
-            echo "${{ secrets.OKX_API_KEY }}" | npx wrangler secret put OKX_API_KEY
-          fi
-          if [ -n "${{ secrets.OKX_SECRET_KEY }}" ]; then
-            echo "${{ secrets.OKX_SECRET_KEY }}" | npx wrangler secret put OKX_SECRET_KEY
-          fi
-          if [ -n "${{ secrets.OKX_PASSPHRASE }}" ]; then
-            echo "${{ secrets.OKX_PASSPHRASE }}" | npx wrangler secret put OKX_PASSPHRASE
-          fi
+          echo "${{ secrets.OKX_API_KEY }}" | npx wrangler secret put OKX_API_KEY
+          echo "${{ secrets.OKX_SECRET_KEY }}" | npx wrangler secret put OKX_SECRET_KEY
+          echo "${{ secrets.OKX_PASSPHRASE }}" | npx wrangler secret put OKX_PASSPHRASE
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.CF_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.API }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Bind Custom Domain Route
         id: route
         run: |
-          if [ -z "${{ secrets.YUM }}" ] || [ -z "${{ steps.names.outputs.domain }}" ]; then
-            echo "Custom domain (YUM) not configured, skipping custom domain route"
-            echo "route_ok=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
           CF_API=https://api.cloudflare.com/client/v4
-          AUTH="Authorization: Bearer $CF_TOKEN"
+          AUTH="Authorization: Bearer ${{ secrets.API }}"
           DOMAIN="${{ steps.names.outputs.domain }}"
           WORKER="${{ steps.names.outputs.worker_name }}"
 
@@ -203,11 +156,7 @@ jobs:
 
       - name: Verify Deployment
         run: |
-          SUB="${{ steps.subdomain.outputs.final_subdomain }}"
-          if [ -z "$SUB" ]; then
-            SUB="${{ steps.names.outputs.safe_qz }}"
-          fi
-          WORKER_URL="https://${{ steps.names.outputs.worker_name }}.$SUB.workers.dev"
+          WORKER_URL="https://${{ steps.names.outputs.worker_name }}.${{ steps.names.outputs.safe_qz }}.workers.dev"
           CUSTOM_URL="https://${{ steps.names.outputs.domain }}"
 
           echo "::notice::Worker URL: $WORKER_URL"

@@ -3,6 +3,3 @@ ALTER TABLE coin_pairs ADD COLUMN smart_volatility_enabled INTEGER NOT NULL DEFA
 ALTER TABLE coin_pairs ADD COLUMN min_volatility_threshold REAL DEFAULT 1.0;
 ALTER TABLE coin_pairs ADD COLUMN current_volatility REAL DEFAULT 0;
 ALTER TABLE coin_pairs ADD COLUMN volatility_status TEXT DEFAULT 'active';
-ALTER TABLE coin_pairs ADD COLUMN add_pos_ratio REAL DEFAULT 0;
-ALTER TABLE coin_pairs ADD COLUMN funding_slices INTEGER DEFAULT 10;
-

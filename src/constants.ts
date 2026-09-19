@@ -20,13 +20,12 @@ export const OKX_ACCOUNT_TRADE = '18';
 export const OKX_ACCOUNT_FUND = '6';
 export const OKX_TRANSFER_TYPE = '0';
 
-// 主循环执行极限硬上限：Cloudflare Workers 单次调用免费版硬上限为 50 次子请求
-// 我们设置安全熔断为 44 次，预留充足安全缓冲，彻底防止触发平台级 Too many subrequests 报错
+// 主循环执行极限硬上限：达到 58 秒或 48 次子请求时必须彻底停止终结本轮全部任务
 export const MAIN_LOOP_MAX_EXEC_MS = 58000;
-export const MAX_SUBREQUESTS_PER_CYCLE = 44;
+export const MAX_SUBREQUESTS_PER_CYCLE = 48;
 
-// 单次网络请求超时 5 秒熔断（适应大包传输与网络波动）
-export const OKX_REQUEST_TIMEOUT_MS = 5000;
+// 单次网络请求超时 2.5 秒熔断
+export const OKX_REQUEST_TIMEOUT_MS = 2500;
 
 // 429/50011 限频局部熔断冷却时间 3 秒
 export const OKX_429_COOLDOWN_MS = 3000;

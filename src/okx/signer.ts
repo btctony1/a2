@@ -11,31 +11,19 @@ import {
 } from '../constants';
 
 let currentInvocationSubrequests = 0;
-let currentInvocationAlgoSyncCount = 0;
 
 export function resetSubrequestCount(): void {
   currentInvocationSubrequests = 0;
-  currentInvocationAlgoSyncCount = 0;
 }
 
 export function getSubrequestCount(): number {
   return currentInvocationSubrequests;
 }
 
-export function getAlgoSyncCount(): number {
-  return currentInvocationAlgoSyncCount;
-}
-
-export function incrementAlgoSyncCount(n: number = 1): void {
-  currentInvocationAlgoSyncCount += n;
-}
-
 /**
  * 检查是否已达到最大子请求上限（48次）
- * 仅在主循环周期内（currentCycleDeadline > 0）进行限制，外部 API/面板请求不被累加计数字段卡死
  */
 export function isSubrequestLimitReached(): boolean {
-  if (currentCycleDeadline <= 0) return false;
   return currentInvocationSubrequests >= MAX_SUBREQUESTS_PER_CYCLE;
 }
 
@@ -219,15 +207,8 @@ export async function okxRequest(
   const targetUrl = `${OKX_BASE_URL}${path}`;
   const url = proxyUrl ? `${proxyUrl}?url=${encodeURIComponent(targetUrl)}` : targetUrl;
 
-  // 判断是否属于豁免主循环熔断拦截的请求（K线行情、行情大包、合约规格大包、资产查询等）
-  const isExempt =
-    path.includes('/market/candles') ||
-    path.includes('/market/history-candles') ||
-    path.includes('/market/tickers') ||
-    path.includes('/market/ticker') ||
-    path.includes('/public/instruments') ||
-    path.includes('/account/balance') ||
-    path.includes('/account/config');
+  // 判断是否属于周期方向判定请求（K线行情 candles 接口），方向判定豁免 50 秒熔断拦截
+  const isDirectionCheck = path.includes('/market/candles') || path.includes('/market/history-candles');
 
   return okxFetch(async () => {
     // 对交易/委托类写操作（POST 下单、撤单、策略单）强制执行 10ms ~ 20ms 的底层微量防抖间隔
@@ -252,7 +233,7 @@ export async function okxRequest(
       headers['OK-ACCESS-PASSPHRASE'] = passphrase;
     }
 
-    // 为单次网络请求挂载 5 秒严格超时控制器 AbortController
+    // 为单次网络请求挂载 2.5 秒严格超时控制器 AbortController
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort();
@@ -272,11 +253,11 @@ export async function okxRequest(
       return resp;
     } catch (fetchErr: any) {
       if (fetchErr?.name === 'AbortError' || String(fetchErr).includes('abort')) {
-        throw new Error(`[网络请求5秒超时] ${path} 未在 ${OKX_REQUEST_TIMEOUT_MS}ms 内响应，已果断熔断释放连接`);
+        throw new Error(`[网络请求2.5秒超时] ${path} 未在 ${OKX_REQUEST_TIMEOUT_MS}ms 内响应，已果断熔断释放连接`);
       }
       throw fetchErr;
     } finally {
       clearTimeout(timer);
     }
-  }, isExempt);
+  }, isDirectionCheck);
 }
