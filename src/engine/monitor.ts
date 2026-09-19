@@ -15,22 +15,11 @@ import {
   setConfigValue,
   updateCoinPair,
 } from '../db/queries';
-import { getInstrumentInfoCached, syncFullPositionAlgoOrder, batchSyncFullPositionAlgoOrders, clearAlgoStateCache } from './scheduler';
+import { getInstrumentInfoCached, syncFullPositionAlgoOrder, syncFixedRoiFullPositionAlgoOrders, clearAlgoStateCache } from './scheduler';
 import { isCycleTimeout, isSubrequestLimitReached } from '../okx/signer';
 export type OKXClientType = ReturnType<typeof import('../okx/live-client').createLiveClient>;
-import type { Position, TimeoutUnit, CoinPair, TradeLog, OKXPosition } from '../types';
+import type { Position, CoinPair, TradeLog, OKXPosition } from '../types';
 import { OKX_FEE_RATE } from '../constants';
-
-function intervalToMs(value: number, unit: any): number {
-  const v = typeof value === 'number' && !isNaN(value) && value > 0 ? value : 1;
-  if (!unit) return v * 3600000;
-  const u = String(unit).toLowerCase().trim();
-  if (u === 'd' || u === 'day' || u === 'days') return v * 86400000;
-  if (u === 'h' || u === 'hour' || u === 'hours') return v * 3600000;
-  if (u === 'm' || u === 'min' || u === 'minute' || u === 'minutes') return v * 60000;
-  if (u === 's' || u === 'sec' || u === 'second' || u === 'seconds') return v * 1000;
-  return v * 3600000;
-}
 
 export function getCleanSymbol(sym: string): string {
   if (!sym) return '';
@@ -54,18 +43,34 @@ function computePnL(position: Position, exitPrice: number): number {
 function resolveCloseReason(position: Position, exitPrice: number, coinConfig?: CoinPair): string {
   if (position.entry_price <= 0 || exitPrice <= 0) return 'manual';
 
-  // 1. 基于持仓实际设置的止盈价格判断（未设止盈或为0时绝不触发）
+  const leverage = position.leverage || coinConfig?.leverage || 10;
+  const pnlRate = position.direction === 'long'
+    ? (exitPrice - position.entry_price) / position.entry_price
+    : (position.entry_price - exitPrice) / position.entry_price;
+  const actualRoiPct = pnlRate * leverage * 100; // 实际全仓收益率百分比 (例如 +10%)
+
+  // 1. 基于持仓实际设置的止盈价格或全仓止盈收益率判断
   const tpPx = position.tp_price > 0 ? position.tp_price : 0;
+  const targetTpRoi = coinConfig?.tp_ratio !== undefined && coinConfig?.tp_ratio !== null ? Number(coinConfig.tp_ratio) : 0;
+
   if (tpPx > 0) {
     if (position.direction === 'long' && exitPrice >= tpPx * 0.998) return 'tp';
     if (position.direction === 'short' && exitPrice <= tpPx * 1.002) return 'tp';
   }
+  if (targetTpRoi > 0 && actualRoiPct >= targetTpRoi * 0.98) {
+    return 'tp';
+  }
 
-  // 2. 基于持仓实际设置的止损价格判断（未设止损或为0时严禁误判为止损）
+  // 2. 基于持仓实际设置的止损价格或全仓止损收益率判断
   const slPx = position.sl_price > 0 ? position.sl_price : 0;
+  const targetSlRoi = coinConfig?.sl_ratio !== undefined && coinConfig?.sl_ratio !== null ? Number(coinConfig.sl_ratio) : 0;
+
   if (slPx > 0) {
     if (position.direction === 'long' && exitPrice <= slPx * 1.002) return 'sl';
     if (position.direction === 'short' && exitPrice >= slPx * 0.998) return 'sl';
+  }
+  if (targetSlRoi > 0 && actualRoiPct <= -targetSlRoi * 0.98) {
+    return 'sl';
   }
 
   return 'manual';
@@ -149,11 +154,17 @@ export async function syncAndSettlePositions(
     }
   } else {
     try {
-      const fetchedTickers = await client.getTickersByType('SWAP');
-      if (fetchedTickers && fetchedTickers.size > 0) {
-        for (const [k, v] of fetchedTickers.entries()) {
-          tickerCache.set(k, v);
-          tickerCache.set(getCleanSymbol(k), v);
+      const neededSymbols = new Set<string>();
+      for (const p of dbPositions) {
+        if (p.symbol) neededSymbols.add(p.symbol);
+      }
+      if (neededSymbols.size > 0) {
+        const fetchedTickers = await client.getTickersForSymbols(Array.from(neededSymbols));
+        if (fetchedTickers && fetchedTickers.size > 0) {
+          for (const [k, v] of fetchedTickers.entries()) {
+            tickerCache.set(k, v);
+            tickerCache.set(getCleanSymbol(k), v);
+          }
         }
       }
     } catch {}
@@ -568,154 +579,6 @@ export async function monitorPositions(
   );
   for (const p of syncAffected) affectedPairs.add(p);
 
-  // 严格执行超时平仓铁律：
-  // 1. 仅针对已达到超时阈值的具体仓位进行单独平仓，绝不全平未到期的仓位
-  // 2. 必须真实向 OKX 发送平仓委托（通过 sz 指定对应张数），平仓成功后再落库结算
-  if (activePositions.length > 0) {
-    const coins = cachedCoins || await getCoinPairs(env);
-    const coinMap = new Map<string, CoinPair>();
-    for (const c of coins) {
-      coinMap.set(c.symbol, c);
-      coinMap.set(getCleanSymbol(c.symbol), c);
-    }
-    const now = Date.now();
-
-    // 精确筛选出已超时的独立仓位
-    const overduePositions = activePositions.filter(p => {
-      const coinConfig = coinMap.get(p.symbol) || coinMap.get(getCleanSymbol(p.symbol));
-      if (!coinConfig || coinConfig.disable_timeout) return false;
-      const timeoutMs = intervalToMs(coinConfig.timeout_value || 4, coinConfig.timeout_unit || 'hour');
-      return (now - p.open_time) >= timeoutMs;
-    });
-
-    if (overduePositions.length > 0) {
-      const timeoutSettleItems: Array<{
-        positionId: number;
-        closeReason: string;
-        closePrice: number;
-        closePnl: number;
-        closeTime: number;
-        tradeLog: Omit<TradeLog, 'id'>;
-      }> = [];
-      let timeoutTotalProfitTransfer = 0;
-
-      for (const position of overduePositions) {
-        if (isCycleTimeout() || isSubrequestLimitReached()) {
-          await insertSystemLog(
-            env,
-            'warn',
-            `[超时平仓] 达到本轮时间/子请求安全上限，彻底终结本轮平仓队列（未平仓单直接丢弃不跨轮压栈）。下一轮主循环将作为全新独立周期重新基于实时持仓进行扫描判定。`
-          );
-          break;
-        }
-
-        const coinConfig = coinMap.get(position.symbol) || coinMap.get(getCleanSymbol(position.symbol));
-        if (!coinConfig) continue;
-
-        try {
-          const closeMarginMode = coinConfig.margin_mode || 'isolated';
-          
-          // 仅对当前这一笔到期持仓对应的张数进行精确平仓，绝不全平该币种其他分笔或未到期仓位
-          let closeSuccess = false;
-          try {
-            await client.closePosition(position.symbol, closeMarginMode, position.direction, position.quantity.toString());
-            closeSuccess = true;
-          } catch (closeErr: any) {
-            const errStr = String(closeErr);
-            // 若交易所已无该持仓（例如已被止盈或外部手动平仓），亦允许进入结算对账
-            if (errStr.includes('51006') || errStr.includes('51008') || errStr.includes('not exist') || errStr.includes('zero') || errStr.includes('0')) {
-              closeSuccess = true;
-            } else {
-              throw closeErr;
-            }
-          }
-
-          if (closeSuccess) {
-            if (position.tp_algo_id) {
-              await client.cancelAlgoOrders(position.symbol, position.tp_algo_id).catch(() => {});
-            }
-
-            const cachedT = tickerMap?.get(position.symbol) || tickerMap?.get(getCleanSymbol(position.symbol));
-            const ticker = cachedT || await client.getTicker(position.symbol).catch(() => null);
-            const exitPrice = ticker?.last ? parseFloat(ticker.last) : (position.last_price || position.entry_price);
-
-            const pnl = computePnL(position, exitPrice);
-            const profitTransferRatio = (coinConfig.profit_transfer_ratio !== undefined && coinConfig.profit_transfer_ratio !== null) ? coinConfig.profit_transfer_ratio : 0;
-            const transferred = pnl > 0 ? pnl * (profitTransferRatio / 100) : 0;
-            timeoutTotalProfitTransfer += transferred;
-
-            timeoutSettleItems.push({
-              positionId: position.id,
-              closeReason: 'timeout',
-              closePrice: exitPrice,
-              closePnl: pnl,
-              closeTime: now,
-              tradeLog: {
-                position_id: position.id,
-                symbol: position.symbol,
-                direction: position.direction,
-                entry_price: position.entry_price,
-                exit_price: exitPrice,
-                quantity: position.quantity,
-                margin: position.margin,
-                pnl,
-                pnl_percent: position.margin > 0 ? (pnl / position.margin) * 100 : 0,
-                close_reason: 'timeout',
-                profit_transferred: transferred,
-                open_time: position.open_time,
-                close_time: now,
-              }
-            });
-
-            const estFee = position.margin * (position.leverage || coinConfig.leverage || 10) * OKX_FEE_RATE;
-            recalcFundingInMemory(
-              coinConfig,
-              position.symbol,
-              pnl,
-              profitTransferRatio,
-              fundingUpdatesBuffer,
-              estFee
-            );
-          }
-        } catch (err: any) {
-          await insertSystemLog(env, 'warn', `[超时平仓异常] ${position.symbol} #${position.id}: ${err?.message || String(err)}`);
-        }
-      }
-
-      if (timeoutSettleItems.length > 0) {
-        try {
-          await batchClosePositionsAndTradeLogs(env, timeoutSettleItems);
-        } catch (err: any) {
-          await insertSystemLog(env, 'error', `批量超时平仓落库失败: ${err?.message || String(err)}`);
-        }
-
-        if (timeoutTotalProfitTransfer > 0.01) {
-          try {
-            await client.transfer({
-              ccy: 'USDT',
-              amt: timeoutTotalProfitTransfer.toFixed(8),
-              from: '18',
-              to: '6',
-              type: '0',
-            });
-          } catch (err: any) {
-            console.warn('[Monitor] 自动划转异常:', err);
-          }
-        }
-
-        for (const item of timeoutSettleItems) {
-          const pairKey = `${item.tradeLog.symbol}:${item.tradeLog.direction}`;
-          affectedPairs.add(pairKey);
-          const cleanSym = getCleanSymbol(item.tradeLog.symbol);
-          const algoStateKey = `agg_algo_${cleanSym}_${item.tradeLog.direction}`;
-          setConfigValue(env, algoStateKey, '').catch(() => {});
-        }
-
-        await insertSystemLog(env, 'close', `[超时平仓完成] 精准平仓到期仓位 ${timeoutSettleItems.length} 笔，未到期仓位继续保持持仓`);
-      }
-    }
-  }
-
   if (fundingUpdatesBuffer.size > 0) {
     try {
       const updates = Array.from(fundingUpdatesBuffer.entries()).map(([symbol, fundingAmount]) => ({ symbol, fundingAmount }));
@@ -725,10 +588,10 @@ export async function monitorPositions(
     }
   }
 
-  // 对账或平仓后，针对所有发生仓位变动的币种方向，统一通过轻量化批量同步器更新/清理全仓聚合止盈止损
+  // 对账若有新增纳管持仓，针对变动的币种更新全仓固定收益率止盈止损挂单
   if (affectedPairs.size > 0) {
     try {
-      await batchSyncFullPositionAlgoOrders(
+      await syncFixedRoiFullPositionAlgoOrders(
         client,
         env,
         Array.from(affectedPairs),
@@ -736,7 +599,7 @@ export async function monitorPositions(
         tickerMap
       );
     } catch (syncErr) {
-      console.warn(`[Monitor] 批量同步全仓止盈止损异常:`, syncErr);
+      console.warn(`[Monitor] 固定收益率全仓止盈止损同步异常:`, syncErr);
     }
   }
 

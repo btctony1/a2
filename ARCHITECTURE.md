@@ -101,8 +101,15 @@
 6. 获取合约信息 (`getInstrumentInfo`): `ctVal` 面值, `lotSz` 步进, `minSz` 最小量
 7. 计算下单量: `contracts = floor((margin * leverage) / (ctVal * price) / lotSz) * lotSz`
 8. `contracts < minSz` 则跳过
-9. 计算止盈止损价格 (`tp = price * (1 +/- tp%)`, `sl = price * (1 -/+ sl%)`)
-10. 市价下单 + 挂载止盈止损算法单 (`attachAlgoOrds`, `tpOrdPx='-1'`, `slOrdPx='-1'`)
+9. 计算止盈止损价格 (严格按平台全部仓位“固定模式”收益率 ROI% 计算触发价：`tpTriggerPx = entryPrice * (1 + (tpRatioPct / leverage))`, `slTriggerPx = entryPrice * (1 - (slRatioPct / leverage))`)
+10. 市价下单 + 挂载平台“全部仓位”“固定模式”止盈止损：
+    - `ordType: 'conditional' | 'oco'`（严格指向平台“固定模式”，非 move_order_stop 移动止损）
+    - `closeFraction: '1'`（严格对应平台“全部仓位” 100% 比例，禁止传具体数量 `sz`）
+    - `cxlOnClosePos: true`（平台原生深度绑定持仓，持仓平仓时平台自动注销策略单）
+    - `reduceOnly: true`（严格只减仓模式）
+    - `tpTriggerPxType: 'mark'`, `slTriggerPxType: 'mark'`（标记价格防插针触发）
+    - `tpOrdPx: '-1'`, `slOrdPx: '-1'`（市价全平）
+    - 挂载后由 OKX 交易所撮合系统常驻全量托管生效，后续加仓无需逐个币种改单/撤单重挂，0 网络开销避免消耗 API 请求配额。
 11. 轮询成交价 (最多 3 次, 间隔 500ms)，回退到 `ticker.last`
 12. 写入 `positions` 表 + 记录 `system_logs`
 

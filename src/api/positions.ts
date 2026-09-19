@@ -11,6 +11,7 @@ import {
   batchClosePositionsAndTradeLogs,
   batchUpdateCoinPairsFunding,
   setConfigValue,
+  setConfigValues,
 } from '../db/queries';
 import { createLiveClient } from '../okx/live-client';
 import { OKX_FEE_RATE } from '../constants';
@@ -63,51 +64,67 @@ async function recalcFundingAfterClose(
 
 let cachedLivePriceMap: Map<string, number> | null = null;
 let cachedLivePriceMapTimestamp = 0;
-const LIVE_PRICE_CACHE_TTL_MS = 3000;
+const LIVE_PRICE_CACHE_TTL_MS = 3000; // 3秒内存防刷共享缓存，避免短时间内并发重复拉取行情大包且0写D1
 
-export async function getPositionsHandler(env: Env): Promise<ApiResponse<Position[]>> {
-  // 从 D1 读取当前活跃持仓
-  const positions = await getOpenPositions(env);
-  if (!positions || positions.length === 0) {
-    return { success: true, data: [] };
-  }
-
-  // 批量获取 OKX 全合约真实最新行情价格，用于实时高精度计算全量活跃持仓 PnL（3秒短时内存防刷缓存）
+export async function getLivePriceMapCached(env: Env): Promise<Map<string, number>> {
   const livePriceMap = new Map<string, number>();
   const now = Date.now();
   if (cachedLivePriceMap && now - cachedLivePriceMapTimestamp < LIVE_PRICE_CACHE_TTL_MS) {
     for (const [k, v] of cachedLivePriceMap.entries()) {
       livePriceMap.set(k, v);
     }
-  } else {
-    try {
-      const config = await getConfig(env);
-      const apiKey = env.OKX_API_KEY || config.okx_api_key || '';
-      const secretKey = env.OKX_SECRET_KEY || config.okx_secret_key || '';
-      const passphrase = env.OKX_PASSPHRASE || config.okx_passphrase || '';
+    return livePriceMap;
+  }
+
+  try {
+    const config = await getConfig(env);
+    const apiKey = env.OKX_API_KEY || config.okx_api_key || '';
+    const secretKey = env.OKX_SECRET_KEY || config.okx_secret_key || '';
+    const passphrase = env.OKX_PASSPHRASE || config.okx_passphrase || '';
+    if (apiKey && secretKey && passphrase) {
       const client = createLiveClient(apiKey, secretKey, passphrase, env.OKX_PROXY_URL);
-      const tickers = await client.getTickersByType('SWAP');
-      if (tickers && tickers.size > 0) {
-        for (const [k, v] of tickers.entries()) {
-          if (v?.last) {
-            const p = parseFloat(v.last);
-            if (p > 0) {
-              const clean = getCleanSymbol(k);
-              livePriceMap.set(k, p);
-              livePriceMap.set(clean, p);
-              livePriceMap.set(`${clean}-USDT-SWAP`, p);
-              livePriceMap.set(`${clean}-USDT`, p);
-              livePriceMap.set(`${clean}/USDT`, p);
+      const coins = await getCoinPairs(env);
+      const positions = await getOpenPositions(env);
+      const symbols = new Set<string>();
+      for (const c of coins) if (c.symbol) symbols.add(c.symbol);
+      for (const p of positions) if (p.symbol) symbols.add(p.symbol);
+
+      if (symbols.size > 0) {
+        const tickers = await client.getTickersForSymbols(Array.from(symbols));
+        if (tickers && tickers.size > 0) {
+          for (const [k, v] of tickers.entries()) {
+            if (v?.last) {
+              const p = parseFloat(v.last);
+              if (p > 0) {
+                const clean = getCleanSymbol(k);
+                livePriceMap.set(k, p);
+                livePriceMap.set(clean, p);
+                livePriceMap.set(`${clean}-USDT-SWAP`, p);
+                livePriceMap.set(`${clean}-USDT`, p);
+                livePriceMap.set(`${clean}/USDT`, p);
+              }
             }
           }
+          cachedLivePriceMap = new Map(livePriceMap);
+          cachedLivePriceMapTimestamp = now;
         }
-        cachedLivePriceMap = new Map(livePriceMap);
-        cachedLivePriceMapTimestamp = now;
       }
-    } catch (err) {
-      // 忽略异常，降级使用本地数据库缓存价格
     }
+  } catch (err) {
+    // 忽略异常，降级使用已有缓存
   }
+  return livePriceMap;
+}
+
+export async function getPositionsHandler(env: Env): Promise<ApiResponse<Position[]>> {
+  // 从 D1 读取当前活跃持仓（纯读取，0 D1写入）
+  const positions = await getOpenPositions(env);
+  if (!positions || positions.length === 0) {
+    return { success: true, data: [] };
+  }
+
+  // 批量获取 OKX 全合约真实最新行情价格，用于实时高精度计算全量活跃持仓 PnL（1.5秒内存防刷共享缓存）
+  const livePriceMap = await getLivePriceMapCached(env);
 
   const coins = await getCoinPairs(env);
   const coinPriceMap = new Map<string, number>();
@@ -159,7 +176,9 @@ export async function syncPositionsHandler(env: Env): Promise<ApiResponse<Positi
 
     const client = createLiveClient(apiKey, secretKey, passphrase, env.OKX_PROXY_URL);
     const fundingUpdatesBuffer = new Map<string, number>();
-    const tickerMap = await client.getTickersByType('SWAP').catch(() => new Map());
+    const currentPositions = await getOpenPositions(env);
+    const syms = Array.from(new Set(currentPositions.map((p) => p.symbol).filter(Boolean)));
+    const tickerMap = syms.length > 0 ? await client.getTickersForSymbols(syms).catch(() => new Map()) : new Map();
     const { activePositions } = await syncAndSettlePositions(client, env, fundingUpdatesBuffer, true, tickerMap);
     return { success: true, data: activePositions };
   } catch (err: any) {
@@ -295,43 +314,54 @@ export async function closeAllPositionsHandler(
       return { success: true, data: { closed: 0 } };
     }
 
-    // 第一步：在 OKX 交易所平台级市价全平各个币种持仓，并撤销挂单
-    const tickerCache = new Map<string, number>();
-    for (const targetKey of closeTargets) {
-      const [sym, dir] = targetKey.split(':') as [string, 'long' | 'short'];
-      const coinConfig = coinMap.get(sym) || coinMap.get(getCleanSymbol(sym));
-      const marginMode = coinConfig?.margin_mode || 'isolated';
+    // 第一步：在 OKX 交易所平台级市价全平各个币种持仓，并撤销挂单 (真并发执行，彻底消除逐个串行阻塞)
+    const aggAlgoKeysToClear: Record<string, string> = {};
+    await Promise.all(
+      Array.from(closeTargets).map(async (targetKey) => {
+        const [sym, dir] = targetKey.split(':') as [string, 'long' | 'short'];
+        const coinConfig = coinMap.get(sym) || coinMap.get(getCleanSymbol(sym));
+        const marginMode = coinConfig?.margin_mode || 'isolated';
 
-      try {
-        // 先撤销该币种在该方向的全部挂单/止盈止损单
-        await client.cancelAllAlgoOrdersForInst(sym, dir).catch(() => {});
-        // 清理聚合挂单缓存状态
-        const cleanSym = getCleanSymbol(sym);
-        await setConfigValue(env, `agg_algo_${cleanSym}_${dir}`, '');
+        try {
+          // 并发撤销该币种在该方向的全部挂单/止盈止损单
+          await client.cancelAllAlgoOrdersForInst(sym, dir).catch(() => {});
+          const cleanSym = getCleanSymbol(sym);
+          aggAlgoKeysToClear[`agg_algo_${cleanSym}_${dir}`] = '';
 
-        // 执行 OKX 平台级一键市价全平（不传 sz，直接市价平掉该币种方向所有持仓）
-        await client.closePosition(sym, marginMode, dir).catch((err) => {
-          const errStr = String(err);
-          if (!errStr.includes('51006') && !errStr.includes('51008') && !errStr.includes('not exist') && !errStr.includes('0')) {
-            console.warn(`[CloseAll] OKX closePosition warning [${sym} ${dir}]:`, err);
-          }
-        });
-      } catch (err) {
-        console.warn(`[CloseAll] 平台平仓操作异常 [${sym} ${dir}]:`, err);
-      }
+          // 并发执行 OKX 平台级一键市价全平（不传 sz，直接市价平掉该币种方向所有持仓）
+          await client.closePosition(sym, marginMode, dir).catch((err) => {
+            const errStr = String(err);
+            if (!errStr.includes('51006') && !errStr.includes('51008') && !errStr.includes('not exist') && !errStr.includes('0')) {
+              console.warn(`[CloseAll] OKX closePosition warning [${sym} ${dir}]:`, err);
+            }
+          });
+        } catch (err) {
+          console.warn(`[CloseAll] 平台平仓操作异常 [${sym} ${dir}]:`, err);
+        }
+      })
+    );
+
+    // 批量清理聚合挂单配置缓存状态（单次事务提交）
+    if (Object.keys(aggAlgoKeysToClear).length > 0) {
+      await setConfigValues(env, aggAlgoKeysToClear).catch(() => {});
     }
 
-    // 第二步：获取相关币种的最新市场行情价格作为结算基准
-    for (const pos of toClose) {
-      if (!tickerCache.has(pos.symbol)) {
-        try {
-          const ticker = await client.getTicker(pos.symbol);
-          if (ticker?.last) {
-            tickerCache.set(pos.symbol, parseFloat(ticker.last));
+    // 第二步：批量获取所有待平仓币种的最新市场行情价格作为结算基准 (恒定 1 次子请求打包拉取全合约大包行情，杜绝逐个币种网络请求)
+    const tickerCache = new Map<string, number>();
+    const neededSymbols = Array.from(new Set(toClose.map((p) => p.symbol)));
+    if (neededSymbols.length > 0) {
+      try {
+        const batchTickers = await client.getTickersForSymbols(neededSymbols);
+        for (const sym of neededSymbols) {
+          const t = batchTickers.get(sym)
+            || batchTickers.get(getCleanSymbol(sym))
+            || batchTickers.get(`${getCleanSymbol(sym)}-USDT-SWAP`);
+          if (t?.last && parseFloat(t.last) > 0) {
+            tickerCache.set(sym, parseFloat(t.last));
           }
-        } catch {
-          tickerCache.set(pos.symbol, pos.last_price || pos.entry_price);
         }
+      } catch (e) {
+        console.warn('[CloseAll] 批量获取行情异常，降级使用持仓已有价格:', e);
       }
     }
 

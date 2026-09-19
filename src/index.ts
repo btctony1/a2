@@ -37,7 +37,7 @@ export default {
       }
     }
 
-    if (url.pathname === '/') {
+    if (url.pathname === '/' || url.pathname === '/index.html') {
       return new Response(DASHBOARD_HTML, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });

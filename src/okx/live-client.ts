@@ -1,5 +1,5 @@
 import type { OKXClient, OKXCandle, OKXTicker, OKXInstrumentInfo, OKXPosition, OKXFill, OKXAlgoOrder, OrderParams, OrderResult, BatchOrderResultItem, TransferParams, AlgoOrderParams, AlgoOrderResult } from '../types';
-import { okxRequest } from './signer';
+import { okxRequest, isCycleTimeout, isSubrequestLimitReached, getSubrequestCount } from './signer';
 
 type OKXRawCandle = [string, string, string, string, string, string, string, ...string[]] | OKXCandle;
 
@@ -105,6 +105,90 @@ export function createLiveClient(apiKey: string, secretKey: string, passphrase: 
       return map;
     },
 
+    async getTickersForSymbols(symbols: string[]): Promise<Map<string, OKXTicker>> {
+      const map = new Map<string, OKXTicker>();
+      const rawSymbols = Array.from(new Set(symbols.filter(Boolean)));
+      if (rawSymbols.length === 0) return map;
+
+      // 建立标准化 instId -> 原始输入符号别名的映射
+      const instIdToOriginals = new Map<string, string[]>();
+      for (const rawSym of rawSymbols) {
+        const sym = rawSym.trim().toUpperCase();
+        const instId = sym.endsWith('-SWAP')
+          ? sym
+          : (sym.includes('-') ? (sym.endsWith('-USDT') ? `${sym}-SWAP` : sym) : `${sym}-USDT-SWAP`);
+        if (!instIdToOriginals.has(instId)) {
+          instIdToOriginals.set(instId, []);
+        }
+        instIdToOriginals.get(instId)!.push(rawSym);
+        instIdToOriginals.get(instId)!.push(sym);
+      }
+
+      const saveTickerToMap = (instId: string, ticker: OKXTicker) => {
+        if (!ticker?.last || parseFloat(ticker.last) <= 0) return;
+        map.set(instId, ticker);
+        const withoutSwap = instId.replace(/-SWAP$/, '');
+        map.set(withoutSwap, ticker);
+        const clean = withoutSwap.replace(/[\/\-_]/g, '').replace(/USDT$/, '');
+        map.set(clean, ticker);
+        map.set(`${clean}-USDT-SWAP`, ticker);
+        map.set(`${clean}-USDT`, ticker);
+        map.set(`${clean}/USDT`, ticker);
+        const originals = instIdToOriginals.get(instId) || [];
+        for (const orig of originals) {
+          map.set(orig, ticker);
+        }
+      };
+
+      // 方案A：使用 OKX 全合约大包端点 (/api/v5/market/tickers?instType=SWAP)
+      // 坚决不逐个币种发起请求！恒定 1 次子请求打包拉取全量合约行情。
+      // 单次网络超时已升至 5 秒（OKX_REQUEST_TIMEOUT_MS = 5000），适应大包传输。
+      // 若遇网络波动，整批统一等待 5000ms（5秒）后重试大包，最多重试 2 次。
+      const targetInstIds = Array.from(instIdToOriginals.keys());
+      const maxBatchRetries = 2;
+
+      for (let attempt = 0; attempt <= maxBatchRetries; attempt++) {
+        if (isCycleTimeout() || isSubrequestLimitReached()) break;
+
+        // 如果是重试轮次（attempt > 0），统一等待 5000ms（5秒）
+        if (attempt > 0) {
+          await delay(5000);
+          if (isCycleTimeout() || isSubrequestLimitReached()) break;
+        }
+
+        try {
+          const resp = await request('GET', `/api/v5/market/tickers?instType=SWAP`);
+          const json = (await resp.json()) as { code?: string; data?: OKXTicker[] };
+          if (json.code === '0' && Array.isArray(json.data) && json.data.length > 0) {
+            for (const t of json.data) {
+              saveTickerToMap(t.instId, t);
+            }
+            break;
+          }
+        } catch (err) {
+          console.warn(`[OKX] 全量SWAP行情大包拉取第 ${attempt + 1} 次未成功，将在5秒后重试:`, err);
+        }
+      }
+
+      // 若有目标币种未在 SWAP 中解析（例如配置了现货 SPOT 币种），同样采用单次大包处理，绝不逐币发包
+      const unresolved = targetInstIds.filter((id) => !map.has(id));
+      if (unresolved.length > 0 && !isCycleTimeout() && !isSubrequestLimitReached()) {
+        try {
+          const respSpot = await request('GET', `/api/v5/market/tickers?instType=SPOT`);
+          const jsonSpot = (await respSpot.json()) as { code?: string; data?: OKXTicker[] };
+          if (jsonSpot.code === '0' && Array.isArray(jsonSpot.data)) {
+            for (const t of jsonSpot.data) {
+              saveTickerToMap(t.instId, t);
+            }
+          }
+        } catch (spotErr) {
+          console.warn(`[OKX] 全量SPOT行情大包拉取补充失败:`, spotErr);
+        }
+      }
+
+      return map;
+    },
+
     getPosMode,
 
     async setPosMode(mode: 'long_short_mode'): Promise<void> {
@@ -120,23 +204,60 @@ export function createLiveClient(apiKey: string, secretKey: string, passphrase: 
 
     async getBalance(): Promise<{ trade_account: number; fund_account: number }> {
       const resp = await request('GET', '/api/v5/account/balance');
-      const json = await resp.json() as { code?: string; msg?: string; data?: Array<{ details?: Array<{ ccy: string; availBal: string }> }> };
+      const json = await resp.json() as {
+        code?: string;
+        msg?: string;
+        data?: Array<{
+          totalEq?: string;
+          adjEq?: string;
+          details?: Array<{
+            ccy: string;
+            eq?: string;
+            cashBal?: string;
+            availBal?: string;
+            availEq?: string;
+            disEq?: string;
+          }>;
+        }>;
+      };
       if (json.code && json.code !== '0') {
         throw new Error(`OKX balance API error: [${json.code}] ${json.msg || 'unknown'}`);
       }
       if (!json.data || json.data.length === 0) {
         throw new Error(`OKX balance API returned empty data: ${JSON.stringify(json)}`);
       }
-      const details = json.data[0].details;
-      if (!details || details.length === 0) {
-        throw new Error(`OKX balance has no asset details: ${JSON.stringify(json.data[0]).slice(0, 200)}`);
+
+      const acc = json.data[0];
+      const details = acc.details || [];
+
+      // 1. 优先查找 USDT 币种资产
+      const usdt = details.find((d) => (d.ccy || '').toUpperCase() === 'USDT');
+      let usdtVal = 0;
+      if (usdt) {
+        usdtVal = parseFloat(usdt.availEq || usdt.availBal || usdt.cashBal || usdt.eq || '0') || 0;
       }
-      const usdt = details.find((d) => d.ccy === 'USDT');
-      if (!usdt || parseFloat(usdt.availBal) <= 0) {
-        throw new Error(`USDT balance is zero or not found, availBal: ${usdt?.availBal || 'N/A'}. Available currencies: ${details.map(d => d.ccy).join(', ')}`);
+
+      // 2. 若 USDT 未持有或为0，支持读取 OKX 账户总净值 (totalEq)
+      let totalEq = parseFloat(acc.totalEq || acc.adjEq || '0') || 0;
+
+      // 3. 若依然为0，累加所有币种的折算/可用资产
+      if (usdtVal <= 0 && totalEq <= 0 && details.length > 0) {
+        for (const d of details) {
+          const val = parseFloat(d.availEq || d.availBal || d.cashBal || d.eq || '0') || 0;
+          if (val > 0) {
+            totalEq += val;
+          }
+        }
       }
-      return { trade_account: parseFloat(usdt.availBal), fund_account: 0 };
+
+      const finalTradeAccount = usdtVal > 0 ? usdtVal : totalEq;
+      if (finalTradeAccount <= 0) {
+        throw new Error(`OKX 账户交易可用资金为 0 (USDT可用: ${usdt?.availBal || usdt?.cashBal || '0'}, 账户总权益: ${acc.totalEq || '0'})`);
+      }
+
+      return { trade_account: finalTradeAccount, fund_account: 0 };
     },
+
 
     async placeOrder(params: OrderParams): Promise<OrderResult> {
       const bodyObj: Record<string, unknown> = {
@@ -362,16 +483,16 @@ export function createLiveClient(apiKey: string, secretKey: string, passphrase: 
     },
 
     async attachAlgoOrder(params: AlgoOrderParams): Promise<AlgoOrderResult> {
-      const bodyObj: Record<string, string> = {
+      const bodyObj: Record<string, any> = {
         instId: params.instId,
         tdMode: params.tdMode,
         side: params.side,
         ordType: params.ordType,
-        cxlOnClosePos: 'true', // 仓位平仓后，止盈止损策略挂单自动撤销
-        reduceOnly: 'true',    // 严格只减仓
+        cxlOnClosePos: true, // 核心铁律：必须使用原生布尔值 true，使 OKX 严格将策略单与仓位绑定（平仓自动撤单，开启固定模式）
+        reduceOnly: true,    // 核心铁律：必须使用原生布尔值 true，严格只减仓模式
       };
 
-      // 核心铁律：若指定 closeFraction (如 "1" 代表全部仓位 100%)，则不传固定数量 sz，直接挂在平台对应的“全部仓位”上
+      // 核心铁律：必须对应平台“全部仓位”挂单，传递 closeFraction: '1'（100%仓位比例减仓），不传固定数量 sz
       if (params.closeFraction) {
         bodyObj.closeFraction = params.closeFraction;
       } else if (params.sz) {
@@ -385,12 +506,12 @@ export function createLiveClient(apiKey: string, secretKey: string, passphrase: 
       if (params.tpTriggerPx) {
         bodyObj.tpTriggerPx = params.tpTriggerPx;
         bodyObj.tpOrdPx = params.tpOrdPx || '-1';
-        bodyObj.tpTriggerPxType = 'last';
+        bodyObj.tpTriggerPxType = params.tpTriggerPxType || 'mark';
       }
       if (params.slTriggerPx) {
         bodyObj.slTriggerPx = params.slTriggerPx;
         bodyObj.slOrdPx = params.slOrdPx || '-1';
-        bodyObj.slTriggerPxType = 'last';
+        bodyObj.slTriggerPxType = params.slTriggerPxType || 'mark';
       }
       if (params.algoClOrdId) {
         bodyObj.algoClOrdId = params.algoClOrdId;

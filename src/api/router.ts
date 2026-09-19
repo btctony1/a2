@@ -1,7 +1,25 @@
 import { Hono } from 'hono';
 import { getStatus } from './status';
 import { getConfigHandler, updateConfigHandler } from './config';
-import { getCoinsHandler, updateCoinHandler, retryCoinHandler, addCoinHandler, deleteCoinHandler, syncOkxCoinsHandler } from './coins';
+import {
+  getCoinsHandler,
+  updateCoinHandler,
+  retryCoinHandler,
+  addCoinHandler,
+  deleteCoinHandler,
+  syncOkxCoinsHandler,
+  startAllCoinsHandler,
+  stopAllCoinsHandler,
+  getGlobalParamsHandler,
+  saveGlobalParamsHandler,
+  batchUpdateCoinParamsHandler,
+  previewSmartCoinsHandler,
+  importSmartCoinsHandler,
+  getSmartConfigHandler,
+  saveSmartConfigHandler,
+  runSmartImportNowHandler,
+  getOverviewHandler,
+} from './coins';
 import { getPositionsHandler, syncPositionsHandler, closePositionHandler, closeAllPositionsHandler } from './positions';
 import { getTradesHandler, clearTradesHandler } from './trades';
 import { getLogsHandler, clearLogsHandler } from './logs';
@@ -92,15 +110,44 @@ export function createRouter(): Hono<{ Bindings: Bindings }> {
   });
 
   // Protected business routes
+  app.get('/api/overview', async (c) => c.json(await getOverviewHandler(c.env.env)));
+  app.get('/api/account/balance', async (c) => c.json(await getOverviewHandler(c.env.env)));
   app.get('/api/status', async (c) => c.json(await getStatus(c.env.env)));
   app.get('/api/config', async (c) => c.json(await getConfigHandler(c.env.env)));
   app.post('/api/config', async (c) => c.json(await updateConfigHandler(c.env.env, await c.req.json())));
   app.get('/api/coins', async (c) => c.json(await getCoinsHandler(c.env.env)));
   app.post('/api/coins', async (c) => c.json(await updateCoinHandler(c.env.env, await c.req.json())));
+  app.get('/api/coins/global-params', async (c) => c.json(await getGlobalParamsHandler(c.env.env)));
+  app.post('/api/coins/global-params', async (c) => c.json(await saveGlobalParamsHandler(c.env.env, await c.req.json())));
+  app.post('/api/coins/batch-update', async (c) => c.json(await batchUpdateCoinParamsHandler(c.env.env, await c.req.json())));
+  app.get('/api/coins/smart-config', async (c) => c.json(await getSmartConfigHandler(c.env.env)));
+  app.post('/api/coins/smart-config', async (c) => c.json(await saveSmartConfigHandler(c.env.env, await c.req.json())));
+  app.post('/api/coins/smart-preview', async (c) => c.json(await previewSmartCoinsHandler(c.env.env, await c.req.json())));
+  app.post('/api/coins/smart-import', async (c) => c.json(await importSmartCoinsHandler(c.env.env, await c.req.json(), c.executionCtx)));
+  app.post('/api/coins/smart-run-now', async (c) => c.json(await runSmartImportNowHandler(c.env.env, c.executionCtx)));
+  app.post('/api/coins/start-all', async (c) => c.json(await startAllCoinsHandler(c.env.env, c.executionCtx)));
+  app.post('/api/coins/stop-all', async (c) => c.json(await stopAllCoinsHandler(c.env.env)));
   app.post('/api/coins/retry', async (c) => c.json(await retryCoinHandler(c.env.env, await c.req.json())));
   app.post('/api/coins/sync-okx', async (c) => c.json(await syncOkxCoinsHandler(c.env.env)));
   app.patch('/api/coins', async (c) => c.json(await addCoinHandler(c.env.env, await c.req.json())));
-  app.delete('/api/coins', async (c) => c.json(await deleteCoinHandler(c.env.env, await c.req.json())));
+  
+  const handleCoinsDelete = async (c: any) => {
+    let body: any = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = {};
+    }
+    const querySymbol = c.req.query('symbol');
+    if (querySymbol && !body.symbol && !body.symbols) {
+      body.symbol = querySymbol;
+    }
+    return c.json(await deleteCoinHandler(c.env.env, body));
+  };
+
+  app.delete('/api/coins', handleCoinsDelete);
+  app.post('/api/coins/delete', handleCoinsDelete);
+  app.post('/api/coins/batch-delete', handleCoinsDelete);
   app.get('/api/positions', async (c) => c.json(await getPositionsHandler(c.env.env)));
   app.post('/api/positions/sync', async (c) => c.json(await syncPositionsHandler(c.env.env)));
   app.post('/api/close-position', async (c) => c.json(await closePositionHandler(c.env.env, await c.req.json())));

@@ -10,14 +10,21 @@ import {
   setConfigValue,
   updateCoinPair,
   getConfigValue,
+  setConfigValues,
   batchUpdateCoinPairs,
   batchInsertPositions,
+  batchUpsertAggregatedPositions,
   batchInsertSystemLogs,
 } from '../db/queries';
 import { getCleanSymbol } from './monitor';
 import { refreshCoinDirection } from './direction';
 import { triggerCircuitBreak, isCycleTimeout, isSubrequestLimitReached } from '../okx/signer';
-import { OPEN_POSITION_JITTER_MS, MARGIN_JITTER_PERCENT, MAX_ORDER_RETRIES, ORDER_FAILURE_CIRCUIT_BREAK_MS } from '../constants';
+import {
+  OPEN_POSITION_JITTER_MS,
+  MARGIN_JITTER_PERCENT,
+  MAX_ORDER_RETRIES,
+  ORDER_FAILURE_CIRCUIT_BREAK_MS,
+} from '../constants';
 
 function intervalToMs(value: number, unit: any): number {
   const v = typeof value === 'number' && !isNaN(value) && value > 0 ? value : 1;
@@ -31,16 +38,14 @@ function intervalToMs(value: number, unit: any): number {
 }
 
 function computeFundingSlices(
-  timeoutValue?: number | null,
-  timeoutUnit?: any,
+  coin: CoinPair,
   intervalValue?: number | null,
   intervalUnit?: any
 ): number {
-  if (!timeoutValue || !intervalValue) return 1;
-  const timeoutMs = intervalToMs(timeoutValue, timeoutUnit);
-  const intervalMs = intervalToMs(intervalValue, intervalUnit);
-  if (intervalMs <= 0) return 1;
-  return Math.max(1, Math.floor(timeoutMs / intervalMs));
+  if (coin.funding_slices && coin.funding_slices > 0) {
+    return Math.max(1, Math.floor(coin.funding_slices));
+  }
+  return 10;
 }
 
 function getTickDecimals(tickSz: string): number {
@@ -85,6 +90,54 @@ export function formatPriceToTick(
 
 function alignPrice(value: number, tickSz: string, direction: 'up' | 'down'): number {
   return parseFloat(formatPriceToTick(value, tickSz, direction));
+}
+
+/**
+ * 严格按平台全部仓位收益率（ROI%）计算止盈止损触发价格
+ * 规则：
+ * 收益率 ROI = (价格变动率) * 杠杆
+ * 价格变动率 = 收益率 / 杠杆
+ * 做多（long）：
+ *   tpTriggerPx = entryPrice * (1 + (tpRatioPct / leverage))
+ *   slTriggerPx = entryPrice * (1 - (slRatioPct / leverage))
+ * 做空（short）：
+ *   tpTriggerPx = entryPrice * (1 - (tpRatioPct / leverage))
+ *   slTriggerPx = entryPrice * (1 + (slRatioPct / leverage))
+ */
+export function calculateRoiTpSlPrices(
+  entryPrice: number,
+  direction: 'long' | 'short',
+  leverage: number,
+  tpRatioPct: number,
+  slRatioPct: number,
+  tickSz: string
+): { tpTriggerPx?: string; slTriggerPx?: string } {
+  if (entryPrice <= 0) return {};
+  const lev = leverage > 0 ? leverage : 10;
+  let tpTriggerPx: string | undefined;
+  let slTriggerPx: string | undefined;
+
+  if (tpRatioPct > 0) {
+    const priceRate = tpRatioPct / lev;
+    const targetPx = direction === 'long'
+      ? entryPrice * (1 + priceRate)
+      : entryPrice * (1 - priceRate);
+    if (targetPx > 0) {
+      tpTriggerPx = formatPriceToTick(targetPx, tickSz, direction === 'long' ? 'up' : 'down');
+    }
+  }
+
+  if (slRatioPct > 0) {
+    const priceRate = slRatioPct / lev;
+    const targetPx = direction === 'long'
+      ? entryPrice * (1 - priceRate)
+      : entryPrice * (1 + priceRate);
+    if (targetPx > 0) {
+      slTriggerPx = formatPriceToTick(targetPx, tickSz, direction === 'long' ? 'down' : 'up');
+    }
+  }
+
+  return { tpTriggerPx, slTriggerPx };
 }
 
 const memoryInstCache = new Map<string, any>();
@@ -144,6 +197,15 @@ export async function getInstrumentInfoCached(env: Env, client: OKXClient, symbo
       return cachedMem;
     }
   }
+
+  // 核心优化：若缓存中未命中，优先通过 1 次性全量合约大包接口预拉取并填充全量内存（杜绝按币种逐一发起网络请求）
+  if (!forceRefresh && (!cachedAllInstrumentsMap || cachedAllInstrumentsMap.size === 0)) {
+    await preloadAllInstruments(client);
+    if (memoryInstCache.has(symbol)) {
+      return memoryInstCache.get(symbol);
+    }
+  }
+
   try {
     const info = await client.getInstrumentInfo(symbol, true);
     if (info && parseFloat(info.ctVal) > 0 && parseFloat(info.minSz) > 0) {
@@ -195,14 +257,29 @@ export async function openPosition(
   // 1. 下单前准备：发起 1 次统一批量请求预加载全量 SWAP 合约面值与交易规则
   const instrumentsMap = await preloadAllInstruments(client);
 
-  // 确保批量行情数据就绪（若未传入则单次批量获取全量 SWAP 行情）
+  // 确保批量行情数据就绪（若未传入或存在缺失，则统一批量定向获取并执行批量重试，绝不逐个币种处理）
   let activeTickerMap = tickerMap;
-  if (!activeTickerMap || activeTickerMap.size === 0) {
+  if (!activeTickerMap) {
+    activeTickerMap = new Map();
+  }
+
+  // 统一检查所有候选币种是否在 activeTickerMap 中具有有效行情
+  const candidateSymbols = candidateCoins.map((c) => c.symbol);
+  const missingCandidateSymbols = candidateSymbols.filter((sym) => {
+    const clean = getCleanSymbol(sym);
+    const t = activeTickerMap!.get(sym) || activeTickerMap!.get(clean);
+    return !t?.last || parseFloat(t.last) <= 0;
+  });
+
+  // 若有缺失币种，一次性统一批量拉取并批量重试（绝不进入逐个币种轮询与重试）
+  if (missingCandidateSymbols.length > 0) {
     try {
-      activeTickerMap = await client.getTickersByType('SWAP');
+      const fetched = await client.getTickersForSymbols(missingCandidateSymbols);
+      for (const [k, v] of fetched.entries()) {
+        activeTickerMap.set(k, v);
+      }
     } catch (e) {
-      console.warn('[openPosition] 批量获取行情失败:', e);
-      activeTickerMap = new Map();
+      console.warn('[openPosition] 批量补齐候选币种行情失败:', e);
     }
   }
 
@@ -247,10 +324,10 @@ export async function openPosition(
   // 3. 内存中批量并发/极速遍历所有候选币种完成纯计算（0 额外网络开销）
   for (const coin of candidateCoins) {
     try {
-      // 兜底保障：若该币种方向为空或尚未成功判定，立即补充触发一次方向判定
+      // 兜底保障：若该币种方向为空或尚未成功判定，立即补充触发一次基于历史K线的方向判定
       if (!coin.direction && coin.period) {
         try {
-          const dir = await refreshCoinDirection(client, env, coin, 'immediate', activeTickerMap);
+          const dir = await refreshCoinDirection(client, env, coin, 'immediate');
           coin.direction = dir;
         } catch (dirErr: any) {
           await insertSystemLog(
@@ -278,7 +355,7 @@ export async function openPosition(
             await insertSystemLog(
               env,
               'info',
-              `[${coin.symbol}] 智能下单过滤：当前振幅(${currentVol.toFixed(2)}%) < 阈值(${threshold.toFixed(2)}%)，已自动暂停下单等待行情波动`
+              `[${coin.symbol}] 智能下单过滤：上两根完整K线振幅(${currentVol.toFixed(2)}%) < 阈值(${threshold.toFixed(2)}%)，已自动暂停下单等待行情波动`
             );
           }
           continue;
@@ -290,8 +367,8 @@ export async function openPosition(
         continue;
       }
 
-      if (!coin.leverage || coin.leverage <= 0 || !coin.open_interval_value || !coin.open_interval_unit || !coin.timeout_value || !coin.timeout_unit) {
-        await insertSystemLog(env, 'warn', `${coin.symbol} 交易参数未完整配置(杠杆/持仓时间/下单间隔)，跳过本轮开单`);
+      if (!coin.leverage || coin.leverage <= 0 || !coin.open_interval_value || !coin.open_interval_unit) {
+        await insertSystemLog(env, 'warn', `${coin.symbol} 交易参数未完整配置(杠杆/下单间隔)，跳过本轮开单`);
         continue;
       }
 
@@ -330,12 +407,18 @@ export async function openPosition(
         }
       }
 
-      // 从批量预拉取的行情映射中读取最新价格
-      const ticker = activeTickerMap?.get(coin.symbol);
+      // 从预拉取的批量行情映射中读取最新价格（已在前序阶段完成统一批量拉取与批量重试）
+      const cleanSym = getCleanSymbol(coin.symbol);
+      const ticker = activeTickerMap?.get(coin.symbol) || activeTickerMap?.get(cleanSym);
       let currentPrice = ticker?.last ? parseFloat(ticker.last) : 0;
 
+      // 如果在批量预拉取与批量重试后仍未获取到，兜底尝试读取数据库已存的最新行情作为最后防线
+      if ((!currentPrice || isNaN(currentPrice) || currentPrice <= 0) && coin.last_price && coin.last_price > 0) {
+        currentPrice = coin.last_price;
+      }
+
       if (!currentPrice || isNaN(currentPrice) || currentPrice <= 0) {
-        await insertSystemLog(env, 'warn', `${coin.symbol} 获取当前行情价格失败，跳过本轮开单`);
+        await insertSystemLog(env, 'warn', `${coin.symbol} 批量获取行情价格失败(已批量重试2次)，跳过本轮开单`);
         continue;
       }
 
@@ -346,7 +429,6 @@ export async function openPosition(
       // 3. 若有持仓且亏损 (收益率 < 0%)：
       //    - 若未设置加仓幅度 (<= 0 或 null)，正常下单；
       //    - 若设置了加仓幅度 (如 2%)，需达到设定的亏损幅度后 (浮亏 >= 2%) 才允许下单加仓；未达到则跳过本次下单。
-      const cleanSym = getCleanSymbol(coin.symbol);
       const matchingDbPos = allOpenDbPositions.filter(
         (p) => (p.symbol === coin.symbol || getCleanSymbol(p.symbol) === cleanSym) && p.direction === coin.direction
       );
@@ -413,11 +495,10 @@ export async function openPosition(
       let totalInitialAmount = coin.funding_amount;
 
       const fundingSlices = computeFundingSlices(
-        coin.timeout_value,
-        coin.timeout_unit as TimeoutUnit,
+        coin,
         intervalValue,
         intervalUnit
-      ) || 1;
+      );
 
       let margin = totalInitialAmount / fundingSlices;
 
@@ -589,10 +670,10 @@ export async function openPosition(
     }
   }
 
-  // 开仓完毕后，针对所有发生仓位变动的币种方向，通过轻量化批量同步器更新全仓 100% 比例聚合止盈止损
+  // 开仓完毕后，针对所有实际发生成交变动的币种方向，按最新均价立即更新固定收益率全仓止盈止损
   if (affectedPairs.size > 0) {
     try {
-      await batchSyncFullPositionAlgoOrders(
+      await syncFixedRoiFullPositionAlgoOrders(
         client,
         env,
         Array.from(affectedPairs),
@@ -601,7 +682,7 @@ export async function openPosition(
         coinPairs
       );
     } catch (syncErr) {
-      console.warn(`[AlgoOrder] 批量同步全仓止盈止损异常:`, syncErr);
+      console.warn(`[AlgoOrder] 同步全仓固定收益率止盈止损异常:`, syncErr);
     }
   }
 
@@ -648,24 +729,16 @@ async function batchHandleOrderSuccess(
     let initTpPx = 0;
     let initSlPx = 0;
     if (entryPrice > 0) {
-      if (tpRatioPct > 0) {
-        initTpPx = parseFloat(
-          formatPriceToTick(
-            direction === 'long' ? entryPrice * (1 + tpRatioPct) : entryPrice * (1 - tpRatioPct),
-            tickSz,
-            direction === 'long' ? 'up' : 'down'
-          )
-        );
-      }
-      if (slRatioPct > 0) {
-        initSlPx = parseFloat(
-          formatPriceToTick(
-            direction === 'long' ? entryPrice * (1 - slRatioPct) : entryPrice * (1 + slRatioPct),
-            tickSz,
-            direction === 'long' ? 'down' : 'up'
-          )
-        );
-      }
+      const { tpTriggerPx, slTriggerPx } = calculateRoiTpSlPrices(
+        entryPrice,
+        direction,
+        leverage,
+        tpRatioPct,
+        slRatioPct,
+        tickSz
+      );
+      if (tpTriggerPx) initTpPx = parseFloat(tpTriggerPx);
+      if (slTriggerPx) initSlPx = parseFloat(slTriggerPx);
     }
 
     positionsToInsert.push({
@@ -699,24 +772,30 @@ async function batchHandleOrderSuccess(
 
   await Promise.all([
     batchUpdateCoinPairs(env, coinUpdates),
-    batchInsertPositions(env, positionsToInsert),
+    batchUpsertAggregatedPositions(env, positionsToInsert),
     batchInsertSystemLogs(env, logsToInsert),
   ]);
 }
 
 /**
- * 批量全仓聚合止盈止损同步器 (OKX closeFraction: "1" 全部仓位 100% 比例平仓委托)
- * 极端行情多币种同时触发时，统一批量计算，批量撤单与原子修改，严禁逐个订单串行消耗 API
+ * 固定模式全仓止盈止损同步器 (OKX closeFraction: "1" 全部仓位 100% 比例平仓委托)
+ * 核心逻辑（严格对齐平台固定模式与铁律）：
+ * 1. 严格按平台全部仓位的止盈止损固定模式收益率（ROI%）进行挂单；
+ * 2. 挂单成功后（closeFraction: "1"），交易所原生全仓托管，后续加仓自动全仓继承，
+ *    无需每一个币种每次下单都重复挂单、撤单或改单，彻底避免海量无效网络请求与频控超限；
+ * 3. 仅在仓位首次建仓或前次全平后重新开仓时，批量并发执行平台挂单，真正实现纯API批量极速处理。
  */
-export async function batchSyncFullPositionAlgoOrders(
+export async function syncFixedRoiFullPositionAlgoOrders(
   client: OKXClient,
   env: Env,
   affectedPairs: string[],
   activePositions?: Position[],
   tickerMap?: Map<string, any>,
-  cachedCoins?: CoinPair[]
+  cachedCoins?: CoinPair[],
+  prefetchedAlgoOrders?: any[]
 ): Promise<void> {
-  if (!affectedPairs || affectedPairs.length === 0) return;
+  const uniquePairs = Array.from(new Set(affectedPairs.filter((p) => typeof p === 'string' && !!p)));
+  if (uniquePairs.length === 0) return;
 
   const allOpenPositions = activePositions || await getOpenPositions(env);
   const coins = cachedCoins || await getCoinPairs(env);
@@ -726,37 +805,94 @@ export async function batchSyncFullPositionAlgoOrders(
     coinMap.set(getCleanSymbol(c.symbol), c);
   }
 
-  const keysToClear: string[] = [];
-
-  const pairsToProcess: Array<{
-    symbol: string;
-    cleanSym: string;
-    direction: 'long' | 'short';
-    algoStateKey: string;
-    matchingPositions: Position[];
-    coin: CoinPair;
-    tpRatioPct: number;
-    slRatioPct: number;
-  }> = [];
-
-  for (const pairKey of affectedPairs) {
+  // 1. 快速初筛：已在内存或持久化存储中拥有有效 algoId 的币种，平台全仓策略单已生效，0 网络开销直接跳过！
+  const pairsNeedingCheck: string[] = [];
+  for (const pairKey of uniquePairs) {
     const [symbol, direction] = pairKey.split(':') as [string, 'long' | 'short'];
     if (!symbol || !direction) continue;
 
     const cleanSym = getCleanSymbol(symbol);
     const algoStateKey = `agg_algo_${cleanSym}_${direction}`;
-    const matchingPositions = allOpenPositions.filter(
-      (p) => (p.symbol === symbol || getCleanSymbol(p.symbol) === cleanSym) && p.direction === direction
-    );
+    let cached = memoryAlgoStateCache.get(algoStateKey);
+    if (!cached) {
+      // 容错冷启动：若内存缓存尚未填充，检查 D1 持久化存储
+      try {
+        const dbVal = await getConfigValue(env, algoStateKey);
+        if (dbVal) {
+          const parsed = JSON.parse(dbVal);
+          if (parsed && parsed.algoId) {
+            cached = parsed;
+            memoryAlgoStateCache.set(algoStateKey, parsed);
+          }
+        }
+      } catch {}
+    }
+    if (cached && cached.algoId) {
+      continue; // 核心铁律：已在平台挂载“全部仓位固定模式”委托，后续只管加仓，绝对不重复改单！0开销直接跳过！
+    }
+    pairsNeedingCheck.push(pairKey);
+  }
+
+  if (pairsNeedingCheck.length === 0) {
+    return;
+  }
+
+  // 2. 单次批量获取全量待生效策略单与 OKX 持仓（避免逐个币种网络请求消耗配额）
+  let pendingAlgos = prefetchedAlgoOrders;
+  if (!pendingAlgos) {
+    try {
+      pendingAlgos = await client.getAllPendingAlgoOrders().catch(() => []);
+    } catch {
+      pendingAlgos = [];
+    }
+  }
+
+  const pendingAlgoMap = new Map<string, any>();
+  if (Array.isArray(pendingAlgos)) {
+    for (const algo of pendingAlgos) {
+      const sym = algo.instId;
+      const clean = getCleanSymbol(sym);
+      const side = algo.posSide || (algo.side === 'sell' ? 'long' : 'short');
+      pendingAlgoMap.set(`${sym}:${side}`, algo);
+      pendingAlgoMap.set(`${clean}:${side}`, algo);
+    }
+  }
+
+  let livePositions: OKXPosition[] = [];
+  try {
+    livePositions = await client.getPositions().catch(() => []);
+  } catch {
+    livePositions = [];
+  }
+  const livePosMap = new Map<string, OKXPosition>();
+  for (const lp of livePositions) {
+    const sym = lp.instId;
+    const clean = getCleanSymbol(sym);
+    const side = lp.posSide === 'short' ? 'short' : lp.posSide === 'long' ? 'long' : (parseFloat(lp.pos || '0') < 0 ? 'short' : 'long');
+    if (Math.abs(parseFloat(lp.pos || '0')) > 0.000001) {
+      livePosMap.set(`${sym}:${side}`, lp);
+      livePosMap.set(`${clean}:${side}`, lp);
+    }
+  }
+
+  // 3. 逐个核对并筛选真正需要挂单/更新的币种
+  const toPlaceList: Array<{
+    symbol: string;
+    direction: 'long' | 'short';
+    coin: CoinPair;
+    avgEntryPrice: number;
+    leverage: number;
+    tpTriggerPx?: string;
+    slTriggerPx?: string;
+    algoStateKey: string;
+  }> = [];
+
+  for (const pairKey of pairsNeedingCheck) {
+    const [symbol, direction] = pairKey.split(':') as [string, 'long' | 'short'];
+    const cleanSym = getCleanSymbol(symbol);
+    const algoStateKey = `agg_algo_${cleanSym}_${direction}`;
 
     const coin = coinMap.get(symbol) || coinMap.get(cleanSym);
-
-    // 仓位已平或未设止盈止损时，OKX 交易所会对全仓止盈止损(closeFraction: 1)自动完成并失效，直接清理本地状态，无需多余撤单请求
-    if (matchingPositions.length === 0) {
-      keysToClear.push(algoStateKey);
-      continue;
-    }
-
     if (!coin) continue;
 
     const coinTp = coin.tp_ratio !== undefined && coin.tp_ratio !== null ? Number(coin.tp_ratio) : 0;
@@ -764,239 +900,138 @@ export async function batchSyncFullPositionAlgoOrders(
     const tpRatioPct = coinTp > 0 ? coinTp / 100 : 0;
     const slRatioPct = coinSl > 0 ? coinSl / 100 : 0;
 
-    if (tpRatioPct <= 0 && slRatioPct <= 0) {
-      keysToClear.push(algoStateKey);
-      continue;
+    if (tpRatioPct <= 0 && slRatioPct <= 0) continue;
+
+    // 获取持仓真实均价与实际杠杆
+    const livePos = livePosMap.get(`${symbol}:${direction}`) || livePosMap.get(`${cleanSym}:${direction}`);
+    let avgEntryPrice = livePos ? parseFloat(livePos.avgPx) || 0 : 0;
+    let leverage = livePos ? parseFloat(livePos.lever) || coin.leverage || 10 : (coin.leverage || 10);
+
+    if (avgEntryPrice <= 0) {
+      const matchingPositions = allOpenPositions.filter(
+        (p) => (p.symbol === symbol || getCleanSymbol(p.symbol) === cleanSym) && p.direction === direction
+      );
+      if (matchingPositions.length > 0) {
+        avgEntryPrice = matchingPositions[0].entry_price || 0;
+        leverage = matchingPositions[0].leverage || leverage;
+      }
     }
 
-    pairsToProcess.push({
-      symbol,
-      cleanSym,
+    if (avgEntryPrice <= 0) continue;
+
+    const info = await getInstrumentInfoCached(env, client, symbol);
+    const tickSz = info.tickSz || '0.1';
+
+    // 核心铁律：严格按平台全部仓位“固定模式”收益率（ROI%）计算触发价格（非涨跌幅%）
+    const { tpTriggerPx, slTriggerPx } = calculateRoiTpSlPrices(
+      avgEntryPrice,
       direction,
-      algoStateKey,
-      matchingPositions,
-      coin,
+      leverage,
       tpRatioPct,
       slRatioPct,
+      tickSz
+    );
+
+    if (!tpTriggerPx && !slTriggerPx) continue;
+
+    // 检查 OKX 平台上是否已经存在该币种方向的未完成策略单
+    const existingPlatformAlgo = pendingAlgoMap.get(`${symbol}:${direction}`) || pendingAlgoMap.get(`${cleanSym}:${direction}`);
+    if (existingPlatformAlgo && existingPlatformAlgo.algoId) {
+      const stateObj = {
+        algoId: String(existingPlatformAlgo.algoId),
+        tpTriggerPx: existingPlatformAlgo.tpTriggerPx || '',
+        slTriggerPx: existingPlatformAlgo.slTriggerPx || '',
+        updateTime: Date.now(),
+      };
+      memoryAlgoStateCache.set(algoStateKey, stateObj);
+      setConfigValue(env, algoStateKey, JSON.stringify(stateObj)).catch(() => {});
+      continue; // 核心铁律：平台已存在生效中的“全部仓位固定模式”委托，后续只管加仓，无需改单！0开销直接跳过！
+    }
+
+    toPlaceList.push({
+      symbol,
+      direction,
+      coin,
+      avgEntryPrice,
+      leverage,
+      tpTriggerPx,
+      slTriggerPx,
+      algoStateKey,
     });
   }
 
-  // 批量清除已平仓状态缓存（内存即时清除 + 异步轻量持久化）
-  for (const k of keysToClear) {
-    memoryAlgoStateCache.delete(k);
-    setConfigValue(env, k, '').catch(() => {});
-  }
+  if (toPlaceList.length === 0) return;
 
-  // 对仍有持仓的币种，在批量同步阶段统一进行内存加权均价与止盈止损计算，直接原子修改(Amend)或挂载
-  const syncSinglePair = async (item: typeof pairsToProcess[0], isRetry = false): Promise<boolean> => {
-    const { symbol, direction, algoStateKey, matchingPositions, coin, tpRatioPct, slRatioPct } = item;
-    let info = await getInstrumentInfoCached(env, client, symbol);
-    let ctVal = parseFloat(info.ctVal) || 1;
-    const tickSz = info.tickSz || '0.1';
+  // 4. 批量并发执行平台全部仓位策略挂单（每批 5 个，微步节奏，绝不超频控）
+  for (let i = 0; i < toPlaceList.length; i += 5) {
+    const chunk = toPlaceList.slice(i, i + 5);
+    await Promise.all(
+      chunk.map(async (item) => {
+        const { symbol, direction, coin, avgEntryPrice, leverage, tpTriggerPx, slTriggerPx, algoStateKey } = item;
+        const dirText = direction === 'long' ? '做多' : '做空';
+        const marginMode = coin.margin_mode || 'isolated';
+        const closeSide = direction === 'long' ? 'sell' : 'buy';
+        // 严格对齐平台固定模式：若同时有止盈和止损使用 oco，单边使用 conditional（条件单即固定模式）
+        const ordType = (tpTriggerPx && slTriggerPx) ? 'oco' : 'conditional';
 
-    let totalQty = 0;
-    let totalCost = 0;
-    for (const pos of matchingPositions) {
-      const qty = pos.quantity || 0;
-      const px = pos.entry_price || 0;
-      totalQty += qty;
-      totalCost += qty * ctVal * px;
-    }
-
-    const avgEntryPrice = (totalQty > 0 && totalCost > 0)
-      ? (totalCost / (totalQty * ctVal))
-      : matchingPositions[0].entry_price;
-
-    if (avgEntryPrice <= 0) return true;
-
-    let tpTriggerPx: string | undefined;
-    let slTriggerPx: string | undefined;
-
-    if (tpRatioPct > 0) {
-      tpTriggerPx = formatPriceToTick(
-        direction === 'long' ? avgEntryPrice * (1 + tpRatioPct) : avgEntryPrice * (1 - tpRatioPct),
-        tickSz,
-        direction === 'long' ? 'up' : 'down'
-      );
-    }
-
-    if (slRatioPct > 0) {
-      slTriggerPx = formatPriceToTick(
-        direction === 'long' ? avgEntryPrice * (1 - slRatioPct) : avgEntryPrice * (1 + slRatioPct),
-        tickSz,
-        direction === 'long' ? 'down' : 'up'
-      );
-    }
-
-    let parsedAlgo: { algoId?: string; tpTriggerPx?: string; slTriggerPx?: string } | null = memoryAlgoStateCache.get(algoStateKey) || null;
-    if (!parsedAlgo) {
-      const existingAlgoStr = await getConfigValue(env, algoStateKey);
-      if (existingAlgoStr) {
         try {
-          parsedAlgo = JSON.parse(existingAlgoStr);
-          if (parsedAlgo) memoryAlgoStateCache.set(algoStateKey, parsedAlgo);
-        } catch {}
-      }
-    }
-
-    if (
-      parsedAlgo &&
-      parsedAlgo.algoId &&
-      parsedAlgo.tpTriggerPx === tpTriggerPx &&
-      parsedAlgo.slTriggerPx === slTriggerPx
-    ) {
-      // 价格完全一致，0 网络请求直接跳过，0 D1写入
-      return true;
-    }
-
-    const dirText = direction === 'long' ? '做多' : '做空';
-
-    // 优先直接原子修改 (Direct Amend)
-    if (parsedAlgo && parsedAlgo.algoId) {
-      try {
-        const amendSuccess = await client.amendAlgoOrder({
-          instId: symbol,
-          algoId: parsedAlgo.algoId,
-          newTpTriggerPx: tpTriggerPx,
-          newTpOrdPx: '-1',
-          newSlTriggerPx: slTriggerPx,
-          newSlOrdPx: '-1',
-        });
-
-        if (amendSuccess) {
-          const stateObj = {
-            algoId: parsedAlgo.algoId,
+          const algoRes = await client.attachAlgoOrder({
+            instId: symbol,
+            tdMode: marginMode,
+            side: closeSide,
+            posSide: direction,
+            ordType,
+            closeFraction: '1', // 核心铁律：严格对应平台“全部仓位” 100% 规则，不传 sz
+            cxlOnClosePos: true, // 核心铁律：原生布尔值与仓位深度绑定，平仓自动撤单
+            reduceOnly: true,    // 核心铁律：严格只减仓
             tpTriggerPx,
+            tpTriggerPxType: 'mark', // 标记价格触发，对齐平台防插针固定止盈
+            tpOrdPx: '-1',           // 市价全平
             slTriggerPx,
-            avgEntryPrice,
-            totalQty,
-            updateTime: Date.now(),
-          };
-          memoryAlgoStateCache.set(algoStateKey, stateObj);
-          await setConfigValue(env, algoStateKey, JSON.stringify(stateObj)).catch(() => {});
+            slTriggerPxType: 'mark', // 标记价格触发，对齐平台防插针固定止损
+            slOrdPx: '-1',           // 市价全平
+          });
 
+          if (algoRes && algoRes.algoId) {
+            const stateObj = {
+              algoId: algoRes.algoId,
+              tpTriggerPx,
+              slTriggerPx,
+              avgEntryPrice,
+              leverage,
+              updateTime: Date.now(),
+            };
+            memoryAlgoStateCache.set(algoStateKey, stateObj);
+            setConfigValue(env, algoStateKey, JSON.stringify(stateObj)).catch(() => {});
+
+            const logTpPart = coin.tp_ratio ? `止盈 +${coin.tp_ratio}%(触发价${tpTriggerPx})` : '';
+            const logSlPart = coin.sl_ratio ? `止损 -${coin.sl_ratio}%(触发价${slTriggerPx})` : '';
+            const logTargetPart = [logTpPart, logSlPart].filter(Boolean).join(' / ');
+
+            await insertSystemLog(
+              env,
+              'info',
+              `【固定模式·全部仓位收益率】已对齐平台固定模式：${symbol}(${dirText}) 开仓均价 ${avgEntryPrice.toFixed(4)}，杠杆 ${leverage}x，目标收益率 ${logTargetPart}（全部仓位100%市价平仓，固定模式按钮已开启）`
+            );
+          }
+        } catch (err: any) {
+          console.warn(`[FixedRoiAlgo] ${symbol} 固定收益率止盈止损挂单失败:`, err?.message || String(err));
           await insertSystemLog(
             env,
-            'info',
-            `[全仓止盈止损修改] ${symbol} ${dirText}${isRetry ? '(熔断重试)' : '(直接原子修改)'}: 累计持仓${totalQty}张(加权均价${avgEntryPrice.toFixed(4)}) → 止盈${tpTriggerPx || '未设'} / 止损${slTriggerPx || '未设'}`
+            'warn',
+            `【固定模式·全部仓位】${symbol}(${dirText}) 策略挂单失败: ${err?.message || String(err)}`
           );
-          return true;
         }
-      } catch (amendErr) {
-        console.warn(`[BatchAlgo] amend-algos 失败，准备重新挂载:`, amendErr);
-      }
-
-      // 改单未成功（可能单双边类型变动或旧单已失效触发），主动安全撤销旧单释放仓位，防止下发新单时 51088 冲突
-      await client.cancelAlgoOrders(symbol, undefined, parsedAlgo.algoId).catch(() => {});
-    }
-
-    // 若是重试轮次，安全确保清理可能存在的同向遗留策略单
-    if (isRetry) {
-      await client.cancelAllAlgoOrdersForInst(symbol, direction).catch(() => {});
-    }
-
-    // 若此前未挂载过策略单或修改失败，直接下发全新全仓止盈止损单
-    const marginMode = coin.margin_mode || 'isolated';
-    const closeSide = direction === 'long' ? 'sell' : 'buy';
-    const ordType = (tpTriggerPx && slTriggerPx) ? 'oco' : 'conditional';
-
-    try {
-      const algoRes = await client.attachAlgoOrder({
-        instId: symbol,
-        tdMode: marginMode,
-        side: closeSide,
-        posSide: direction,
-        ordType,
-        closeFraction: '1',
-        tpTriggerPx,
-        tpOrdPx: '-1',
-        slTriggerPx,
-        slOrdPx: '-1',
-      });
-
-      if (algoRes && algoRes.algoId) {
-        const stateObj = {
-          algoId: algoRes.algoId,
-          tpTriggerPx,
-          slTriggerPx,
-          avgEntryPrice,
-          totalQty,
-          updateTime: Date.now(),
-        };
-        memoryAlgoStateCache.set(algoStateKey, stateObj);
-        await setConfigValue(env, algoStateKey, JSON.stringify(stateObj)).catch(() => {});
-
-        await insertSystemLog(
-          env,
-          'info',
-          `[全仓聚合止盈止损] ${symbol} ${dirText}${isRetry ? '(熔断重试挂单成功)' : '已建立挂单(100%全仓)'}: 累计持仓${totalQty}张(加权均价${avgEntryPrice.toFixed(4)}) → 止盈${tpTriggerPx || '未设'} / 止损${slTriggerPx || '未设'}`
-        );
-        return true;
-      }
-    } catch (algoErr: any) {
-      console.warn(`[BatchAlgo] 挂载全仓止盈止损失败:`, algoErr);
-      if (!isRetry) {
-        await insertSystemLog(
-          env,
-          'warn',
-          `[全仓止盈止损提示] ${symbol} 首次挂单未成功 (${algoErr?.message || String(algoErr)})，将在2500ms熔断后重试`
-        );
-      } else {
-        await insertSystemLog(
-          env,
-          'warn',
-          `[全仓止盈止损重试失败] ${symbol} 重试挂单仍未成功 (${algoErr?.message || String(algoErr)})，本轮结束，下轮主循环全新检测`
-        );
-      }
-    }
-
-    return false;
-  };
-
-  const results = await Promise.all(
-    pairsToProcess.map(async (item) => {
-      const ok = await syncSinglePair(item, false);
-      return { item, ok };
-    })
-  );
-
-  const failedPairs = results.filter((r) => !r.ok).map((r) => r.item);
-
-  // 熔断 2500ms 后当前主循环内重试单次（严格受控于时间与子请求熔断）
-  if (failedPairs.length > 0 && !isCycleTimeout() && !isSubrequestLimitReached()) {
-    await new Promise((resolve) => setTimeout(resolve, ORDER_FAILURE_CIRCUIT_BREAK_MS));
-
-    if (isCycleTimeout() || isSubrequestLimitReached()) {
-      return;
-    }
-
-    await insertSystemLog(
-      env,
-      'info',
-      `[全仓止盈止损熔断重试] 检测到 ${failedPairs.length} 个币种全仓止盈止损未完成，已等待2500ms熔断冷却，正在执行本轮单次重试...`
-    );
-    const retryResults = await Promise.all(
-      failedPairs.map(async (item) => {
-        const ok = await syncSinglePair(item, true);
-        return { item, ok };
       })
     );
-
-    const stillFailedPairs = retryResults.filter((r) => !r.ok).map((r) => r.item);
-    // 若重试后依然未成功，同样等待 2500ms 熔断冷却后才能进行队列继续
-    if (stillFailedPairs.length > 0) {
-      await new Promise((resolve) => setTimeout(resolve, ORDER_FAILURE_CIRCUIT_BREAK_MS));
-      await insertSystemLog(
-        env,
-        'info',
-        `[全仓止盈止损熔断保护] 仍有 ${stillFailedPairs.length} 个币种全仓止盈止损未完成，已执行2500ms熔断隔离保护，继续后续队列`
-      );
+    if (i + 5 < toPlaceList.length) {
+      await new Promise((r) => setTimeout(r, 80));
     }
   }
 }
 
 /**
- * 单币种全仓聚合止盈止损同步器（兼容封装，调用 batchSyncFullPositionAlgoOrders）
+ * 兼容导出：单币种全仓固定收益率止盈止损同步器
  */
 export async function syncFullPositionAlgoOrder(
   client: OKXClient,
@@ -1006,7 +1041,7 @@ export async function syncFullPositionAlgoOrder(
   coinConfig?: CoinPair,
   tickerMap?: Map<string, any>
 ): Promise<void> {
-  await batchSyncFullPositionAlgoOrders(
+  await syncFixedRoiFullPositionAlgoOrders(
     client,
     env,
     [`${symbol}:${direction}`],

@@ -4,8 +4,13 @@ build/
 coverage/
 .wrangler/
 .DS_Store
+Thumbs.db
 *.log
 .env
 .env.local
 .env.*.local
 bun.lock
+.idea/
+.vscode/
+*.tmp
+*.temp
