@@ -1,0 +1,378 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+      CF_RAW_TOKEN: ${{ secrets.API || vars.API || secrets.CLOUDFLARE_API_TOKEN || vars.CLOUDFLARE_API_TOKEN }}
+      RAW_QZ: ${{ secrets.QZ || vars.QZ }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Sanitize Token & Credentials
+        id: creds
+        run: |
+          # 自动剥除首尾空格、换行符以及可能被误贴入的外层单/双引号
+          CLEAN_TOKEN=$(echo "$CF_RAW_TOKEN" | tr -d '\r\n\t ' | sed -e 's/^["'\''"]*//' -e 's/["'\''"]*$//')
+          if [ -z "$CLEAN_TOKEN" ]; then
+            echo "::error::未检测到 Cloudflare API Token！请检查 GitHub 仓库设置：名称必须为 API，值填入您的 Cloudflare API Token！"
+            exit 1
+          fi
+          echo "token=$CLEAN_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Sanitize Prefix & Setup Names
+        id: names
+        run: |
+          # 自动剥除首尾空格、换行符以及可能被误贴入的外层单/双引号
+          CLEAN_QZ=$(echo "$RAW_QZ" | tr -d '\r\n\t ' | sed -e 's/^["'\''"]*//' -e 's/["'\''"]*$//')
+          if [ -z "$CLEAN_QZ" ]; then
+            CLEAN_QZ="okx"
+          fi
+          # 转换为合法的子域名/资源标识（全小写、仅保留数字字母和中划线）
+          SAFE=$(echo "$CLEAN_QZ" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+          if [ -z "$SAFE" ]; then
+            SAFE="okx"
+          fi
+          echo "safe_qz=$SAFE" >> $GITHUB_OUTPUT
+          # 所有 CF 资源均严格以域名前缀值命名
+          echo "worker_name=$SAFE" >> $GITHUB_OUTPUT
+          echo "db_name=$SAFE" >> $GITHUB_OUTPUT
+          echo "raw_qz=$CLEAN_QZ" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Type Check
+        run: npm run typecheck
+
+      - name: Get CF Account & Zone Information
+        id: cf_info
+        run: |
+          CF_TOKEN="${{ steps.creds.outputs.token }}"
+          CF_API="https://api.cloudflare.com/client/v4"
+          AUTH_HEADER="Authorization: Bearer $CF_TOKEN"
+
+          # 1. 自动获取 Cloudflare 账户 ID (优先从 Secrets 读取，其次 API，最后通过 Zone 及 wrangler whoami 兜底)
+          ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          if [ -z "$ACCOUNT_ID" ]; then
+            ACCOUNTS_RES=$(curl -s "$CF_API/accounts" -H "$AUTH_HEADER")
+            ACCOUNT_ID=$(echo "$ACCOUNTS_RES" | node -e "
+              const fs = require('fs');
+              try {
+                const d = JSON.parse(fs.readFileSync(0, 'utf8'));
+                if (d && d.result && Array.isArray(d.result) && d.result[0]) {
+                  console.log(d.result[0].id);
+                } else {
+                  console.log('');
+                }
+              } catch(e) {
+                console.log('');
+              }
+            ")
+          fi
+
+          # 2. 自动获取 Cloudflare 上已绑定的域名 (Zone)
+          SPECIFIED_DOMAIN="${{ secrets.YUM }}"
+          ZONES_RES=$(curl -s "$CF_API/zones?per_page=50" -H "$AUTH_HEADER")
+          
+          ZONE_INFO=$(echo "$ZONES_RES" | node -e '
+            const fs = require("fs");
+            try {
+              const d = JSON.parse(fs.readFileSync(0, "utf8"));
+              const list = (d && d.result && Array.isArray(d.result)) ? d.result : [];
+              const specified = "'"$SPECIFIED_DOMAIN"'".trim().toLowerCase();
+              let targetZone = null;
+              if (specified && list.length > 0) {
+                targetZone = list.find(z => z && z.name && z.name.toLowerCase() === specified);
+              }
+              if (!targetZone && list.length > 0) {
+                targetZone = list.find(z => z && z.status === "active") || list[0];
+              }
+              if (targetZone) {
+                console.log(JSON.stringify({
+                  id: targetZone.id,
+                  name: targetZone.name,
+                  account_id: (targetZone.account && targetZone.account.id) || ""
+                }));
+              } else if (specified) {
+                console.log(JSON.stringify({ id: "", name: specified, account_id: "" }));
+              } else {
+                console.error("未能在当前 Cloudflare 账户中检测到绑定的域名 Zone！");
+                process.exit(1);
+              }
+            } catch (err) {
+              console.error("解析 Cloudflare 域名异常:", err.message);
+              process.exit(1);
+            }
+          ')
+
+          ZONE_ID=$(echo "$ZONE_INFO" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).id||''")
+          ZONE_NAME=$(echo "$ZONE_INFO" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).name||''")
+          ZONE_ACC_ID=$(echo "$ZONE_INFO" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).account_id||''")
+
+          if [ -z "$ACCOUNT_ID" ] && [ -n "$ZONE_ACC_ID" ]; then
+            ACCOUNT_ID="$ZONE_ACC_ID"
+            echo "已成功从已绑定的域名 Zone 中提取 Cloudflare Account ID: $ACCOUNT_ID"
+          fi
+
+          # 若 API 直接获取未果，尝试通过 Wrangler CLI 获取
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "尝试使用 wrangler whoami 提取 Account ID..."
+            WHOAMI_OUT=$(npx wrangler whoami 2>/dev/null || true)
+            ACCOUNT_ID=$(echo "$WHOAMI_OUT" | node -e "
+              const fs = require('fs');
+              const str = fs.readFileSync(0, 'utf8');
+              const m = str.match(/Account ID:\s*([a-f0-9]{32})/i) || str.match(/│\s*([a-f0-9]{32})\s*│/);
+              if (m && m[1]) console.log(m[1]);
+              else console.log('');
+            ")
+          fi
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::未能获取到 Cloudflare Account ID，请检查 API Token 是否具备 Account:Read 或 Zone:Read 权限，或在 GitHub Secrets 中添加 CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "已成功获取 Cloudflare Account ID: $ACCOUNT_ID"
+
+          ZONE_ID=$(echo "$ZONE_INFO" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).id||''")
+          ZONE_NAME=$(echo "$ZONE_INFO" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).name||''")
+          
+          # 如果通过 zones?name 再次尝试补齐 zone_id
+          if [ -z "$ZONE_ID" ] && [ -n "$ZONE_NAME" ]; then
+            ZONE_QUERY=$(curl -s "$CF_API/zones?name=$ZONE_NAME" -H "$AUTH_HEADER")
+            ZONE_ID=$(echo "$ZONE_QUERY" | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync(0,'utf8'));if(d&&d.result&&d.result[0])console.log(d.result[0].id);else console.log('')}catch(e){console.log('')}")
+          fi
+
+          SAFE_QZ="${{ steps.names.outputs.safe_qz }}"
+          FULL_DOMAIN="${SAFE_QZ}.${ZONE_NAME}"
+
+          echo "zone_id=$ZONE_ID" >> $GITHUB_OUTPUT
+          echo "zone_name=$ZONE_NAME" >> $GITHUB_OUTPUT
+          echo "full_domain=$FULL_DOMAIN" >> $GITHUB_OUTPUT
+
+          echo "=================================================="
+          echo "已成功获取 Cloudflare 域名配置:"
+          echo "已绑定根域名: $ZONE_NAME (Zone ID: $ZONE_ID)"
+          echo "系统前端最终访问地址: $FULL_DOMAIN"
+          echo "=================================================="
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+
+      - name: Create & Configure D1 Database
+        id: d1
+        run: |
+          DB_NAME="${{ steps.names.outputs.db_name }}"
+          CF_TOKEN="${{ steps.creds.outputs.token }}"
+          ACCOUNT_ID="${{ steps.cf_info.outputs.account_id }}"
+          CF_API="https://api.cloudflare.com/client/v4"
+          AUTH_HEADER="Authorization: Bearer $CF_TOKEN"
+
+          echo "正在创建/检索 D1 数据库: $DB_NAME ..."
+          npx wrangler d1 create "$DB_NAME" --location=apac 2>/dev/null || true
+
+          # 1. 优先使用 wrangler d1 list 获取 D1 UUID
+          DB_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "
+            const fs = require('fs');
+            try {
+              const raw = fs.readFileSync(0, 'utf8');
+              const s = raw.indexOf('[');
+              const e = raw.lastIndexOf(']');
+              const d = (s !== -1 && e !== -1) ? JSON.parse(raw.slice(s, e + 1)) : JSON.parse(raw);
+              const db = Array.isArray(d) ? d.find(x => x && (x.name === '$DB_NAME' || x.database_name === '$DB_NAME' || x.name === '$DB_NAME-db')) : null;
+              const id = db ? (db.uuid || db.id || db.database_id) : null;
+              if (id) console.log(id);
+              else console.log('');
+            } catch(e) { console.log(''); }
+          ")
+
+          # 2. 若 wrangler 获取未果，使用 Cloudflare REST API 兜底检索
+          if [ -z "$DB_ID" ]; then
+            echo "尝试通过 Cloudflare REST API 查询 D1 数据库..."
+            D1_RES=$(curl -s "$CF_API/accounts/$ACCOUNT_ID/d1/database?per_page=100" -H "$AUTH_HEADER")
+            DB_ID=$(echo "$D1_RES" | node -e "
+              const fs = require('fs');
+              try {
+                const d = JSON.parse(fs.readFileSync(0, 'utf8'));
+                const list = (d && d.result && Array.isArray(d.result)) ? d.result : [];
+                const db = list.find(x => x && (x.name === '$DB_NAME' || x.name === '$DB_NAME-db'));
+                if (db && (db.uuid || db.id)) console.log(db.uuid || db.id);
+                else console.log('');
+              } catch(e) { console.log(''); }
+            ")
+          fi
+
+          if [ -z "$DB_ID" ]; then
+            echo "::error::未能成功获取 D1 数据库 ID，请检查 API Token 是否具备 D1 读写权限！"
+            exit 1
+          fi
+
+          echo "database_id=$DB_ID" >> $GITHUB_OUTPUT
+          echo "D1 数据库 ID: $DB_ID"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.cf_info.outputs.account_id }}
+
+      - name: Update wrangler.toml with Prefix Names
+        run: |
+          WORKER_NAME="${{ steps.names.outputs.worker_name }}"
+          DB_NAME="${{ steps.names.outputs.db_name }}"
+          DB_ID="${{ steps.d1.outputs.database_id }}"
+          ZONE_NAME="${{ steps.cf_info.outputs.zone_name }}"
+          FULL_DOMAIN="${{ steps.cf_info.outputs.full_domain }}"
+          
+          # 替换配置为对应前缀名称，确保禁用默认 workers_dev 分配地址
+          sed -i "s/name = .*/name = \"$WORKER_NAME\"/g" wrangler.toml
+          sed -i "s/database_name = .*/database_name = \"$DB_NAME\"/g" wrangler.toml
+          sed -i "s/database_id = .*/database_id = \"$DB_ID\"/g" wrangler.toml
+          sed -i "s/workers_dev = .*/workers_dev = false/g" wrangler.toml
+          
+          # 注入 routes 原生配置，让 wrangler deploy 直接绑定自定义域名路由
+          if [ -n "$ZONE_NAME" ] && [ -n "$FULL_DOMAIN" ]; then
+            echo "" >> wrangler.toml
+            echo "routes = [" >> wrangler.toml
+            echo "  { pattern = \"$FULL_DOMAIN/*\", zone_name = \"$ZONE_NAME\" }" >> wrangler.toml
+            echo "]" >> wrangler.toml
+          fi
+          
+          echo "更新后的 wrangler.toml 内容:"
+          cat wrangler.toml
+
+      - name: Initialize D1 Database Schema
+        run: |
+          DB_NAME="${{ steps.names.outputs.db_name }}"
+          echo "执行初始化数据库表结构..."
+          npx wrangler d1 execute "$DB_NAME" --file=./schema.sql --remote --yes
+          sleep 3
+          echo "写入初始化种子数据..."
+          npx wrangler d1 execute "$DB_NAME" --file=./seed.sql --remote --yes || true
+          echo "执行增量数据表结构迁移..."
+          npx wrangler d1 execute "$DB_NAME" --file=./migrate.sql --remote --yes || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.cf_info.outputs.account_id }}
+
+      - name: Deploy Worker to Cloudflare
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.cf_info.outputs.account_id }}
+
+      - name: Sync Worker Secrets (Optional OKX Credentials)
+        run: |
+          if [ -n "${{ secrets.OKX_API_KEY }}" ]; then
+            echo "${{ secrets.OKX_API_KEY }}" | npx wrangler secret put OKX_API_KEY
+          fi
+          if [ -n "${{ secrets.OKX_SECRET_KEY }}" ]; then
+            echo "${{ secrets.OKX_SECRET_KEY }}" | npx wrangler secret put OKX_SECRET_KEY
+          fi
+          if [ -n "${{ secrets.OKX_PASSPHRASE }}" ]; then
+            echo "${{ secrets.OKX_PASSPHRASE }}" | npx wrangler secret put OKX_PASSPHRASE
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.cf_info.outputs.account_id }}
+
+      - name: Disable CF Default workers.dev Subdomain Address
+        run: |
+          CF_TOKEN="${{ steps.creds.outputs.token }}"
+          CF_API="https://api.cloudflare.com/client/v4"
+          AUTH_HEADER="Authorization: Bearer $CF_TOKEN"
+          ACCOUNT_ID="${{ steps.cf_info.outputs.account_id }}"
+          WORKER_NAME="${{ steps.names.outputs.worker_name }}"
+
+          echo "正在禁用 Cloudflare 默认分配的 workers.dev 访问地址..."
+          DISABLE_RES=$(curl -s -X POST "$CF_API/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME/subdomain" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d '{"enabled": false}')
+          echo "禁用 workers.dev 响应: $DISABLE_RES"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.creds.outputs.token }}
+
+      - name: Bind Custom Domain & Configure DNS Routing
+        id: domain_bind
+        run: |
+          CF_TOKEN="${{ steps.creds.outputs.token }}"
+          CF_API="https://api.cloudflare.com/client/v4"
+          AUTH_HEADER="Authorization: Bearer $CF_TOKEN"
+          ACCOUNT_ID="${{ steps.cf_info.outputs.account_id }}"
+          ZONE_ID="${{ steps.cf_info.outputs.zone_id }}"
+          WORKER_NAME="${{ steps.names.outputs.worker_name }}"
+          FULL_DOMAIN="${{ steps.cf_info.outputs.full_domain }}"
+
+          echo "=================================================="
+          echo "开始为 Worker [$WORKER_NAME] 绑定自定义域名: $FULL_DOMAIN"
+          echo "=================================================="
+
+          # 1. 使用 Workers Custom Domains API 幂等绑定自定义域名 (PUT 既支持新增也支持更新)
+          if [ -n "$ZONE_ID" ]; then
+            CUSTOM_DOMAIN_RES=$(curl -s -X PUT "$CF_API/accounts/$ACCOUNT_ID/workers/domains/records" \
+              -H "$AUTH_HEADER" \
+              -H "Content-Type: application/json" \
+              -d "{\"hostname\":\"$FULL_DOMAIN\",\"zone_id\":\"$ZONE_ID\",\"service\":\"$WORKER_NAME\",\"environment\":\"production\"}")
+            echo "Workers Custom Domains (PUT) 响应: $CUSTOM_DOMAIN_RES"
+
+            # 兼容性回退：若 PUT 不支持则尝试 POST
+            SUCCESS_STATUS=$(echo "$CUSTOM_DOMAIN_RES" | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync(0,'utf8'));console.log(d.success?'true':'false')}catch(e){console.log('false')}")
+            if [ "$SUCCESS_STATUS" != "true" ]; then
+              echo "PUT 返回未成功，尝试 POST 绑定..."
+              CUSTOM_DOMAIN_POST_RES=$(curl -s -X POST "$CF_API/accounts/$ACCOUNT_ID/workers/domains/records" \
+                -H "$AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                -d "{\"hostname\":\"$FULL_DOMAIN\",\"zone_id\":\"$ZONE_ID\",\"service\":\"$WORKER_NAME\",\"environment\":\"production\"}")
+              echo "Workers Custom Domains (POST) 响应: $CUSTOM_DOMAIN_POST_RES"
+            fi
+
+            # 2. 双保险：检测并添加带有 Cloudflare 代理的 DNS 记录 (AAAA 100:: proxied=true)
+            DNS_RECORDS=$(curl -s "$CF_API/zones/$ZONE_ID/dns_records?name=$FULL_DOMAIN" -H "$AUTH_HEADER")
+            RECORD_ID=$(echo "$DNS_RECORDS" | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync(0,'utf8'));if(d&&d.result&&d.result[0])console.log(d.result[0].id);else console.log('')}catch(e){console.log('')}")
+
+            if [ -z "$RECORD_ID" ]; then
+              echo "创建 DNS 记录指向 Cloudflare 代理..."
+              DNS_CREATE_RES=$(curl -s -X POST "$CF_API/zones/$ZONE_ID/dns_records" \
+                -H "$AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                -d "{\"type\":\"AAAA\",\"name\":\"$FULL_DOMAIN\",\"content\":\"100::\",\"proxied\":true,\"ttl\":1}")
+              echo "DNS 记录创建结果: $DNS_CREATE_RES"
+            fi
+
+            # 3. 关联 Zone Worker Routes: $FULL_DOMAIN/* -> $WORKER_NAME
+            EXISTING_ROUTES=$(curl -s "$CF_API/zones/$ZONE_ID/workers/routes" -H "$AUTH_HEADER")
+            ROUTE_ID=$(echo "$EXISTING_ROUTES" | node -e "const fs=require('fs');try{const d=JSON.parse(fs.readFileSync(0,'utf8'));if(d&&d.result){const r=d.result.find(x=>x&&x.pattern&&x.pattern.includes('$FULL_DOMAIN'));if(r)console.log(r.id);else console.log('')}else console.log('')}catch(e){console.log('')}")
+
+            ROUTE_PAYLOAD="{\"pattern\":\"$FULL_DOMAIN/*\",\"script\":\"$WORKER_NAME\"}"
+            if [ -n "$ROUTE_ID" ]; then
+              echo "更新已有域名路由规则 ($ROUTE_ID) -> $WORKER_NAME"
+              curl -s -X PUT "$CF_API/zones/$ZONE_ID/workers/routes/$ROUTE_ID" \
+                -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$ROUTE_PAYLOAD"
+            else
+              echo "创建新域名路由规则: $FULL_DOMAIN/* -> $WORKER_NAME"
+              curl -s -X POST "$CF_API/zones/$ZONE_ID/workers/routes" \
+                -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$ROUTE_PAYLOAD"
+            fi
+          fi
+
+          echo "自定义域名绑定与路由配置执行完毕！"
+
+      - name: Deployment Success Summary
+        run: |
+          FULL_DOMAIN="${{ steps.cf_info.outputs.full_domain }}"
+          echo "================================================================"
+          echo "🎉 OKX 自动化交易系统已成功部署至 Cloudflare Workers！"
+          echo "🌐 系统前端 UI 唯一访问域名: https://$FULL_DOMAIN"
+          echo "🔒 CF 默认分配地址 (*.workers.dev) 已全面禁用！"
+          echo "================================================================"

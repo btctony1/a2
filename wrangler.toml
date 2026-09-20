@@ -1,0 +1,16 @@
+name = "okx-auto-trader"
+main = "src/index.ts"
+compatibility_date = "2025-07-19"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "{{DB_NAME}}"
+database_id = "{{D1_DATABASE_ID}}"
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+OKX_PROXY_URL = ""
